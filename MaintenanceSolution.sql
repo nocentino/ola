@@ -1,6 +1,6 @@
-﻿/*
+/*
 
-SQL Server Maintenance Solution - SQL Server 2008, SQL Server 2008 R2, SQL Server 2012, SQL Server 2014, SQL Server 2016, SQL Server 2017, SQL Server 2019, and SQL Server 2022
+SQL Server Maintenance Solution - SQL Server 2008, SQL Server 2008 R2, SQL Server 2012, SQL Server 2014, SQL Server 2016, SQL Server 2017, SQL Server 2019, SQL Server 2022, and SQL Server 2025
 
 Backup: https://ola.hallengren.com/sql-server-backup.html
 Integrity Check: https://ola.hallengren.com/sql-server-integrity-check.html
@@ -10,7 +10,7 @@ License: https://ola.hallengren.com/license.html
 
 GitHub: https://github.com/olahallengren/sql-server-maintenance-solution
 
-Version: 2025-06-14 16:13:00
+Version: 2025-12-20 18:52:13
 
 You can contact me by e-mail at ola@hallengren.com.
 
@@ -137,7 +137,7 @@ BEGIN
   --// Source:  https://ola.hallengren.com                                                        //--
   --// License: https://ola.hallengren.com/license.html                                           //--
   --// GitHub:  https://github.com/olahallengren/sql-server-maintenance-solution                  //--
-  --// Version: 2025-06-14 16:13:00                                                               //--
+  --// Version: 2025-12-20 18:52:13                                                               //--
   ----------------------------------------------------------------------------------------------------
 
   SET NOCOUNT ON
@@ -390,7 +390,6 @@ BEGIN
   ----------------------------------------------------------------------------------------------------
 
 END
-GO
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -400,7 +399,7 @@ BEGIN
 EXEC dbo.sp_executesql @statement = N'CREATE PROCEDURE [dbo].[DatabaseBackup] AS'
 END
 GO
-ALTER PROCEDURE [dbo].[DatabaseBackup]
+CREATE OR ALTER PROCEDURE [dbo].[DatabaseBackup]
 
 @Databases nvarchar(max) = NULL,
 @Directory nvarchar(max) = NULL,
@@ -451,6 +450,13 @@ ALTER PROCEDURE [dbo].[DatabaseBackup]
 @DataDomainBoostUser nvarchar(max) = NULL,
 @DataDomainBoostDevicePath nvarchar(max) = NULL,
 @DataDomainBoostLockboxPath nvarchar(max) = NULL,
+-- Pure Storage Parameters (API version must be included in @PureStorageArrayURL, e.g., 'https://array/api/2.44')
+@PureStorageArrayURL nvarchar(max) = NULL,
+@PureStorageAPIToken nvarchar(max) = NULL,
+@PureStorageProtectionGroup nvarchar(max) = NULL,
+@PureStorageReplicateNow nvarchar(max) = 'N',
+-- Snapshot Mode: SINGLE (per-database), GROUP (selected databases), SERVER (all user databases)
+@SnapshotMode nvarchar(max) = 'SINGLE',
 @DirectoryStructure nvarchar(max) = '{ServerName}${InstanceName}{DirectorySeparator}{DatabaseName}{DirectorySeparator}{BackupType}_{Partial}_{CopyOnly}',
 @AvailabilityGroupDirectoryStructure nvarchar(max) = '{ClusterName}${AvailabilityGroupName}{DirectorySeparator}{DatabaseName}{DirectorySeparator}{BackupType}_{Partial}_{CopyOnly}',
 @DirectoryStructureCase nvarchar(max) = NULL,
@@ -484,7 +490,7 @@ BEGIN
   --// Source:  https://ola.hallengren.com                                                        //--
   --// License: https://ola.hallengren.com/license.html                                           //--
   --// GitHub:  https://github.com/olahallengren/sql-server-maintenance-solution                  //--
-  --// Version: 2025-06-14 16:13:00                                                               //--
+  --// Version: 2025-12-20 18:52:13                                                               //--
   ----------------------------------------------------------------------------------------------------
 
   SET NOCOUNT ON
@@ -553,10 +559,13 @@ BEGIN
   DECLARE @CurrentAvailabilityGroupID uniqueidentifier
   DECLARE @CurrentAvailabilityGroup nvarchar(max)
   DECLARE @CurrentAvailabilityGroupRole nvarchar(max)
+  DECLARE @CurrentAvailabilityGroupDatabaseReplicaSynchronizationState nvarchar(max)
+  DECLARE @CurrentAvailabilityGroupDatabaseReplicaSynchronizationHealth nvarchar(max)
   DECLARE @CurrentAvailabilityGroupBackupPreference nvarchar(max)
   DECLARE @CurrentIsPreferredBackupReplica bit
   DECLARE @CurrentDatabaseMirroringRole nvarchar(max)
   DECLARE @CurrentLogShippingRole nvarchar(max)
+  DECLARE @CurrentBackupOperationSupportedOnSecondaryReplicas bit
 
   DECLARE @CurrentBackupSetID int
   DECLARE @CurrentIsMirror bit
@@ -569,6 +578,14 @@ BEGIN
   DECLARE @CurrentCommand nvarchar(max)
   DECLARE @CurrentCommandOutput int
   DECLARE @CurrentCommandType nvarchar(max)
+
+  -- Multi-database snapshot backup variables
+  DECLARE @SnapshotTaken bit = 0
+  DECLARE @SnapshotName nvarchar(max)
+  DECLARE @SnapshotDatabaseList nvarchar(max)
+  DECLARE @SnapshotDatabaseCount int = 0
+  DECLARE @SnapshotAuthToken nvarchar(max)
+  DECLARE @ServerBackupDone bit = 0
 
   DECLARE @Errors TABLE (ID int IDENTITY PRIMARY KEY,
                          [Message] nvarchar(max) NOT NULL,
@@ -725,6 +742,11 @@ BEGIN
   SET @Parameters += ', @DataDomainBoostUser = ' + ISNULL('''' + REPLACE(@DataDomainBoostUser,'''','''''') + '''','NULL')
   SET @Parameters += ', @DataDomainBoostDevicePath = ' + ISNULL('''' + REPLACE(@DataDomainBoostDevicePath,'''','''''') + '''','NULL')
   SET @Parameters += ', @DataDomainBoostLockboxPath = ' + ISNULL('''' + REPLACE(@DataDomainBoostLockboxPath,'''','''''') + '''','NULL')
+  SET @Parameters += ', @PureStorageArrayURL = ' + ISNULL('''' + REPLACE(@PureStorageArrayURL,'''','''''') + '''','NULL')
+  SET @Parameters += ', @PureStorageAPIToken = ' + ISNULL('''[HIDDEN]''','NULL')
+  SET @Parameters += ', @PureStorageProtectionGroup = ' + ISNULL('''' + REPLACE(@PureStorageProtectionGroup,'''','''''') + '''','NULL')
+  SET @Parameters += ', @PureStorageReplicateNow = ' + ISNULL('''' + REPLACE(@PureStorageReplicateNow,'''','''''') + '''','NULL')
+  SET @Parameters += ', @SnapshotMode = ' + ISNULL('''' + REPLACE(@SnapshotMode,'''','''''') + '''','NULL')
   SET @Parameters += ', @DirectoryStructure = ' + ISNULL('''' + REPLACE(@DirectoryStructure,'''','''''') + '''','NULL')
   SET @Parameters += ', @AvailabilityGroupDirectoryStructure = ' + ISNULL('''' + REPLACE(@AvailabilityGroupDirectoryStructure,'''','''''') + '''','NULL')
   SET @Parameters += ', @DirectoryStructureCase = ' + ISNULL('''' + REPLACE(@DirectoryStructureCase,'''','''''') + '''','NULL')
@@ -1454,6 +1476,7 @@ BEGIN
     WHEN @BackupSoftware = 'LITESPEED' THEN 'bak'
     WHEN @BackupSoftware = 'SQLBACKUP' THEN 'sqb'
     WHEN @BackupSoftware = 'SQLSAFE' THEN 'safe'
+    WHEN @BackupSoftware = 'PURESTORAGE_SNAPSHOT' THEN 'bkm'
     END
   END
 
@@ -1523,7 +1546,7 @@ BEGIN
   --// Check input parameters                                                                     //--
   ----------------------------------------------------------------------------------------------------
 
-  IF @BackupType NOT IN ('FULL','DIFF','LOG') OR @BackupType IS NULL
+  IF @BackupType NOT IN ('FULL','DIFF','LOG','SNAPSHOT') OR @BackupType IS NULL
   BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
     SELECT 'The value for the parameter @BackupType is not supported.', 16, 1
@@ -1535,6 +1558,12 @@ BEGIN
   BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
     SELECT 'SQL Database Managed Instance only supports COPY_ONLY full backups.', 16, 1
+  END
+
+  IF @BackupSoftware = 'PURESTORAGE_SNAPSHOT' AND @BackupType <> 'SNAPSHOT'
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'Pure Storage Snapshot backup only supports snapshot backups.', 16, 2
   END
 
   ----------------------------------------------------------------------------------------------------
@@ -1705,7 +1734,7 @@ BEGIN
 
   ----------------------------------------------------------------------------------------------------
 
-  IF @BackupSoftware NOT IN ('LITESPEED','SQLBACKUP','SQLSAFE','DATA_DOMAIN_BOOST')
+  IF @BackupSoftware NOT IN ('LITESPEED','SQLBACKUP','SQLSAFE','DATA_DOMAIN_BOOST','PURESTORAGE_SNAPSHOT')
   BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
     SELECT 'The value for the parameter @BackupSoftware is not supported.', 16, 1
@@ -1739,6 +1768,18 @@ BEGIN
   BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
     SELECT 'EMC Data Domain Boost is not installed. Download https://www.emc.com/en-us/data-protection/data-domain.htm.', 16, 6
+  END
+
+  IF @BackupSoftware = 'PURESTORAGE_SNAPSHOT' AND @Version < 17
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'Pure Storage Snapshot backup requires SQL Server 2025 or later for external REST endpoint support.', 16, 7
+  END
+
+  IF @BackupSoftware = 'PURESTORAGE_SNAPSHOT' AND NOT EXISTS (SELECT * FROM sys.configurations WHERE name = 'external rest endpoint enabled')
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'Pure Storage Snapshot backup requires external REST endpoint feature which is not available on this SQL Server version.', 16, 8
   END
 
   ----------------------------------------------------------------------------------------------------
@@ -1877,6 +1918,12 @@ BEGIN
     SELECT 'The value for the parameter @NumberOfFiles is not supported.', 16, 7
   END
 
+  IF @NumberOfFiles > 1 AND @BackupSoftware = 'PURESTORAGE_SNAPSHOT'
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @NumberOfFiles is not supported. Pure Storage Snapshot backup only supports single file backups.', 16, 8
+  END
+
   IF @NumberOfFiles < (SELECT COUNT(*) FROM @URLs WHERE Mirror = 0)
   BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
@@ -1979,6 +2026,12 @@ BEGIN
     SELECT 'The value for the parameter @CompressionLevelNumeric is not supported.', 16, 5
   END
 
+  IF @CompressionLevelNumeric IS NOT NULL AND @BackupSoftware = 'PURESTORAGE_SNAPSHOT'
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @CompressionLevelNumeric is not supported.', 16, 6
+  END
+
   ----------------------------------------------------------------------------------------------------
 
   IF LEN(@Description) > 255
@@ -2067,6 +2120,12 @@ BEGIN
     SELECT 'The value for the parameter @Encrypt is not supported.', 16, 3
   END
 
+  IF @Encrypt = 'Y' AND @BackupSoftware = 'PURESTORAGE_SNAPSHOT'
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @Encrypt is not supported.', 16, 4
+  END
+
   ----------------------------------------------------------------------------------------------------
 
   IF @BackupSoftware IS NULL AND @Encrypt = 'Y' AND (@EncryptionAlgorithm NOT IN('AES_128','AES_192','AES_256','TRIPLE_DES_3KEY') OR @EncryptionAlgorithm IS NULL)
@@ -2098,6 +2157,12 @@ BEGIN
   BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
     SELECT 'The value for the parameter @EncryptionAlgorithm is not supported.', 16, 5
+  END
+
+  IF @EncryptionAlgorithm IS NOT NULL AND @BackupSoftware = 'PURESTORAGE_SNAPSHOT'
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @EncryptionAlgorithm is not supported.', 16, 6
   END
 
   ----------------------------------------------------------------------------------------------------
@@ -2176,6 +2241,12 @@ BEGIN
   BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
     SELECT 'The value for the parameter @EncryptionKey is not supported.', 16, 4
+  END
+
+  IF @EncryptionKey IS NOT NULL AND @BackupSoftware = 'PURESTORAGE_SNAPSHOT'
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @EncryptionKey is not supported.', 16, 5
   END
 
   ----------------------------------------------------------------------------------------------------
@@ -2472,6 +2543,86 @@ BEGIN
   BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
     SELECT 'The value for the parameter @DataDomainBoostLockboxPath is not supported.', 16, 1
+  END
+
+  ----------------------------------------------------------------------------------------------------
+
+  IF @PureStorageArrayURL IS NOT NULL AND (@BackupSoftware <> 'PURESTORAGE_SNAPSHOT' OR @BackupSoftware IS NULL)
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @PureStorageArrayURL is not supported.', 16, 1
+  END
+
+  IF @PureStorageArrayURL IS NULL AND @BackupSoftware = 'PURESTORAGE_SNAPSHOT'
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @PureStorageArrayURL is not supported.', 16, 2
+  END
+
+  ----------------------------------------------------------------------------------------------------
+
+  IF @PureStorageAPIToken IS NOT NULL AND (@BackupSoftware <> 'PURESTORAGE_SNAPSHOT' OR @BackupSoftware IS NULL)
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @PureStorageAPIToken is not supported.', 16, 1
+  END
+
+  IF @PureStorageAPIToken IS NULL AND @BackupSoftware = 'PURESTORAGE_SNAPSHOT'
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @PureStorageAPIToken is not supported.', 16, 2
+  END
+
+  ----------------------------------------------------------------------------------------------------
+
+  IF @PureStorageProtectionGroup IS NOT NULL AND (@BackupSoftware <> 'PURESTORAGE_SNAPSHOT' OR @BackupSoftware IS NULL)
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @PureStorageProtectionGroup is not supported.', 16, 1
+  END
+
+  IF @PureStorageProtectionGroup IS NULL AND @BackupSoftware = 'PURESTORAGE_SNAPSHOT'
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @PureStorageProtectionGroup is not supported.', 16, 2
+  END
+
+  IF @PureStorageReplicateNow NOT IN ('Y','N') OR @PureStorageReplicateNow IS NULL
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @PureStorageReplicateNow is not supported.', 16, 1
+  END
+
+  IF @PureStorageReplicateNow IS NOT NULL AND (@BackupSoftware <> 'PURESTORAGE_SNAPSHOT' OR @BackupSoftware IS NULL)
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @PureStorageReplicateNow is not supported.', 16, 2
+  END
+
+  ----------------------------------------------------------------------------------------------------
+
+  IF @SnapshotMode NOT IN ('SINGLE','GROUP','SERVER') OR @SnapshotMode IS NULL
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @SnapshotMode is not supported. Valid values are SINGLE, GROUP, or SERVER.', 16, 1
+  END
+
+  IF @SnapshotMode IN ('GROUP','SERVER') AND @BackupSoftware <> 'PURESTORAGE_SNAPSHOT'
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @SnapshotMode is not supported. GROUP and SERVER modes require @BackupSoftware = PURESTORAGE_SNAPSHOT.', 16, 2
+  END
+
+  IF @SnapshotMode IN ('GROUP','SERVER') AND @BackupType <> 'SNAPSHOT'
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @SnapshotMode is not supported. GROUP and SERVER modes require @BackupType = SNAPSHOT.', 16, 3
+  END
+
+  IF @SnapshotMode = 'SERVER' AND @Databases IS NOT NULL AND @Databases NOT IN ('ALL_DATABASES','USER_DATABASES')
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @SnapshotMode is not supported. SERVER mode requires @Databases = ALL_DATABASES or USER_DATABASES.', 16, 4
   END
 
   ----------------------------------------------------------------------------------------------------
@@ -3106,6 +3257,204 @@ BEGIN
   END
 
   ----------------------------------------------------------------------------------------------------
+  --// Execute multi-database snapshot (GROUP/SERVER mode)                                        //--
+  ----------------------------------------------------------------------------------------------------
+
+  IF @BackupSoftware = 'PURESTORAGE_SNAPSHOT' AND @SnapshotMode IN ('GROUP','SERVER') AND NOT EXISTS (SELECT * FROM @Errors WHERE Severity >= 16)
+  BEGIN
+    -- Build the list of databases to snapshot
+    SELECT @SnapshotDatabaseList = STUFF((
+      SELECT ', ' + QUOTENAME(DatabaseName)
+      FROM @tmpDatabases
+      WHERE Selected = 1
+      AND DatabaseType = 'U'  -- Only user databases (system databases cannot be snapshot backed up)
+      ORDER BY [Order]
+      FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '')
+
+    SELECT @SnapshotDatabaseCount = COUNT(*)
+    FROM @tmpDatabases
+    WHERE Selected = 1
+    AND DatabaseType = 'U'
+
+    IF @SnapshotDatabaseCount > 64
+    BEGIN
+      INSERT INTO @Errors ([Message], Severity, [State])
+      SELECT 'The maximum number of databases for snapshot backup is 64. Selected database count: ' + CAST(@SnapshotDatabaseCount AS nvarchar), 16, 1
+    END
+
+    IF @SnapshotDatabaseCount > 0 AND NOT EXISTS (SELECT * FROM @Errors WHERE Severity >= 16)
+    BEGIN
+      SET @CurrentMessage = 'Starting multi-database snapshot backup for ' + CAST(@SnapshotDatabaseCount AS nvarchar) + ' databases...'
+      RAISERROR('%s',10,1,@CurrentMessage) WITH NOWAIT
+
+      SET @CurrentMessage = 'Databases: ' + @SnapshotDatabaseList
+      RAISERROR('%s',10,1,@CurrentMessage) WITH NOWAIT
+
+      RAISERROR(@EmptyLine,10,1) WITH NOWAIT
+
+      -- Build the suspend command based on mode
+      DECLARE @SuspendCommand nvarchar(max)
+      DECLARE @SnapshotResponse nvarchar(max)
+      DECLARE @SnapshotRet int
+
+      IF @SnapshotMode = 'SERVER'
+      BEGIN
+        -- SERVER mode: Suspend all user databases
+        IF @CopyOnly = 'Y'
+          SET @SuspendCommand = 'ALTER SERVER CONFIGURATION SET SUSPEND_FOR_SNAPSHOT_BACKUP = ON (MODE = COPY_ONLY);'
+        ELSE
+          SET @SuspendCommand = 'ALTER SERVER CONFIGURATION SET SUSPEND_FOR_SNAPSHOT_BACKUP = ON;'
+      END
+      ELSE
+      BEGIN
+        -- GROUP mode: Suspend specific databases
+        DECLARE @GroupList nvarchar(max)
+        SELECT @GroupList = STUFF((
+          SELECT ', ' + QUOTENAME(DatabaseName)
+          FROM @tmpDatabases
+          WHERE Selected = 1
+          AND DatabaseType = 'U'
+          ORDER BY [Order]
+          FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '')
+
+        IF @CopyOnly = 'Y'
+          SET @SuspendCommand = 'ALTER SERVER CONFIGURATION SET SUSPEND_FOR_SNAPSHOT_BACKUP = ON (GROUP = (' + @GroupList + '), MODE = COPY_ONLY);'
+        ELSE
+          SET @SuspendCommand = 'ALTER SERVER CONFIGURATION SET SUSPEND_FOR_SNAPSHOT_BACKUP = ON (GROUP = (' + @GroupList + '));'
+      END
+
+      BEGIN TRY
+        SET @CurrentMessage = 'Suspending databases for snapshot backup...'
+        RAISERROR('%s',10,1,@CurrentMessage) WITH NOWAIT
+
+        IF @Execute = 'Y'
+        BEGIN
+          EXEC sp_executesql @SuspendCommand
+
+          SET @CurrentMessage = 'Databases suspended successfully.'
+          RAISERROR('%s',10,1,@CurrentMessage) WITH NOWAIT
+
+          -- Login to Pure Storage array
+          SET @CurrentMessage = 'Authenticating to Pure Storage array...'
+          RAISERROR('%s',10,1,@CurrentMessage) WITH NOWAIT
+
+          DECLARE @LoginHeaders nvarchar(max) = N'{"api-token":"' + @PureStorageAPIToken + '"}'
+          DECLARE @LoginURL nvarchar(max) = @PureStorageArrayURL + '/login'
+
+          EXEC @SnapshotRet = sp_invoke_external_rest_endpoint
+            @url = @LoginURL,
+            @headers = @LoginHeaders,
+            @method = 'POST',
+            @response = @SnapshotResponse OUTPUT
+
+          IF @SnapshotRet <> 0
+          BEGIN
+            RAISERROR('Error logging in to Pure Storage array.',16,1)
+          END
+
+          SET @SnapshotAuthToken = JSON_VALUE(@SnapshotResponse, '$.response.headers."x-auth-token"')
+          IF @SnapshotAuthToken IS NULL OR @SnapshotAuthToken = ''
+          BEGIN
+            RAISERROR('Failed to extract authentication token from response.',16,1)
+          END
+
+          SET @CurrentMessage = 'Authentication successful.'
+          RAISERROR('%s',10,1,@CurrentMessage) WITH NOWAIT
+
+          -- Build snapshot payload with metadata
+          DECLARE @SnapshotPayload nvarchar(max)
+          DECLARE @InstanceName nvarchar(128) = REPLACE(@@SERVERNAME, '\', '_')
+          DECLARE @DateStamp nvarchar(20) = REPLACE(CONVERT(nvarchar, GETDATE(), 112) + '_' + REPLACE(CONVERT(nvarchar, GETDATE(), 108), ':', ''), ' ', '_')
+
+          SET @SnapshotPayload = '{"source_names": "' + @PureStorageProtectionGroup + '", "replicate_now": ' + CASE WHEN @PureStorageReplicateNow = 'Y' THEN 'true' ELSE 'false' END + ', "tags": ['
+          SET @SnapshotPayload += '{"copyable": true, "key": "SnapshotMode", "value": "' + @SnapshotMode + '"},'
+          SET @SnapshotPayload += '{"copyable": true, "key": "DatabaseCount", "value": "' + CAST(@SnapshotDatabaseCount AS nvarchar) + '"},'
+          SET @SnapshotPayload += '{"copyable": true, "key": "SQLInstanceName", "value": "' + @InstanceName + '"},'
+          SET @SnapshotPayload += '{"copyable": true, "key": "BackupTimestamp", "value": "' + @DateStamp + '"},'
+          SET @SnapshotPayload += '{"copyable": true, "key": "BackupType", "value": "SNAPSHOT"},'
+          SET @SnapshotPayload += '{"copyable": true, "key": "BackupSoftware", "value": "Ola_Hallengren_PURESTORAGE_SNAPSHOT"}'
+          SET @SnapshotPayload += ']}'
+
+          -- Take the snapshot
+          SET @CurrentMessage = 'Creating Pure Storage snapshot for Protection Group: ' + @PureStorageProtectionGroup
+          RAISERROR('%s',10,1,@CurrentMessage) WITH NOWAIT
+
+          DECLARE @SnapshotHeaders nvarchar(max) = N'{"x-auth-token":"' + @SnapshotAuthToken + '", "Content-Type":"application/json"}'
+          DECLARE @SnapshotURL nvarchar(max) = @PureStorageArrayURL + '/protection-group-snapshots'
+
+          EXEC @SnapshotRet = sp_invoke_external_rest_endpoint
+            @url = @SnapshotURL,
+            @headers = @SnapshotHeaders,
+            @payload = @SnapshotPayload,
+            @method = 'POST',
+            @response = @SnapshotResponse OUTPUT
+
+          IF @SnapshotRet <> 0
+          BEGIN
+            SET @ErrorMessage = 'Error creating Pure Storage snapshot. Return code: ' + CAST(@SnapshotRet AS nvarchar)
+            RAISERROR('%s',16,1,@ErrorMessage)
+          END
+
+          SET @SnapshotName = JSON_VALUE(@SnapshotResponse, '$.result.items[0].name')
+          IF @SnapshotName IS NULL OR @SnapshotName = ''
+          BEGIN
+            RAISERROR('Failed to extract snapshot name from response.',16,1)
+          END
+
+          SET @SnapshotTaken = 1
+          SET @CurrentMessage = 'Snapshot created successfully: ' + @SnapshotName
+          RAISERROR('%s',10,1,@CurrentMessage) WITH NOWAIT
+        END
+        ELSE
+        BEGIN
+          SET @CurrentMessage = 'Suspend command (not executed): ' + @SuspendCommand
+          RAISERROR('%s',10,1,@CurrentMessage) WITH NOWAIT
+          SET @SnapshotTaken = 1
+          SET @SnapshotName = 'DRY_RUN_SNAPSHOT'
+        END
+      END TRY
+      BEGIN CATCH
+        SET @ErrorMessage = ERROR_MESSAGE()
+        SET @CurrentMessage = 'Error in multi-database snapshot: ' + @ErrorMessage
+        RAISERROR('%s',16,1,@CurrentMessage) WITH NOWAIT
+        SET @ReturnCode = ERROR_NUMBER()
+
+        -- Attempt to unsuspend databases
+        BEGIN TRY
+          IF @SnapshotMode = 'SERVER'
+            EXEC sp_executesql N'ALTER SERVER CONFIGURATION SET SUSPEND_FOR_SNAPSHOT_BACKUP = OFF;'
+          ELSE
+          BEGIN
+            -- Unsuspend each database individually
+            DECLARE @UnsuspendDB nvarchar(max)
+            DECLARE @UnsuspendSQL nvarchar(max)
+            DECLARE db_cursor CURSOR FOR
+              SELECT DatabaseName FROM @tmpDatabases WHERE Selected = 1 AND DatabaseType = 'U'
+            OPEN db_cursor
+            FETCH NEXT FROM db_cursor INTO @UnsuspendDB
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+              BEGIN TRY
+                SET @UnsuspendSQL = N'ALTER DATABASE ' + QUOTENAME(@UnsuspendDB) + ' SET SUSPEND_FOR_SNAPSHOT_BACKUP = OFF;'
+                EXEC sp_executesql @UnsuspendSQL
+              END TRY
+              BEGIN CATCH
+              END CATCH
+              FETCH NEXT FROM db_cursor INTO @UnsuspendDB
+            END
+            CLOSE db_cursor
+            DEALLOCATE db_cursor
+          END
+        END TRY
+        BEGIN CATCH
+        END CATCH
+      END CATCH
+
+      RAISERROR(@EmptyLine,10,1) WITH NOWAIT
+    END
+  END
+
+  ----------------------------------------------------------------------------------------------------
   --// Execute backup commands                                                                    //--
   ----------------------------------------------------------------------------------------------------
 
@@ -3222,6 +3571,12 @@ BEGIN
       FROM sys.dm_hadr_availability_replica_states
       WHERE replica_id = @CurrentReplicaID
 
+      SELECT @CurrentAvailabilityGroupDatabaseReplicaSynchronizationState = synchronization_state_desc,
+             @CurrentAvailabilityGroupDatabaseReplicaSynchronizationHealth = synchronization_health_desc
+      FROM sys.dm_hadr_database_replica_states
+      WHERE replica_id = @CurrentReplicaID
+      AND database_id = DB_ID(@CurrentDatabaseName)
+
       SELECT @CurrentAvailabilityGroup = [name],
              @CurrentAvailabilityGroupBackupPreference = UPPER(automated_backup_preference_desc)
       FROM sys.availability_groups
@@ -3301,13 +3656,14 @@ BEGIN
     SELECT BackupSize = CASE WHEN @CurrentBackupType = 'FULL' THEN COALESCE(CAST(@CurrentAllocatedExtentPageCount AS bigint) * 8192, CAST(@CurrentDatabaseSize AS bigint) * 8192)
                              WHEN @CurrentBackupType = 'DIFF' THEN CAST(@CurrentModifiedExtentPageCount AS bigint) * 8192
                              WHEN @CurrentBackupType = 'LOG' THEN CAST(@CurrentLogSizeSinceLastLogBackup * 1024 * 1024 AS bigint)
+                             WHEN @CurrentBackupType = 'SNAPSHOT' THEN 1024
                              END,
-           MaxNumberOfFiles = CASE WHEN @BackupSoftware IN('SQLBACKUP','DATA_DOMAIN_BOOST') THEN 32 ELSE 64 END,
+           MaxNumberOfFiles = CASE WHEN @BackupSoftware IN('SQLBACKUP','DATA_DOMAIN_BOOST','PURESTORAGE_SNAPSHOT') THEN 32 ELSE 64 END,
            CASE WHEN (SELECT COUNT(*) FROM @Directories WHERE Mirror = 0) > 0 THEN (SELECT COUNT(*) FROM @Directories WHERE Mirror = 0) ELSE (SELECT COUNT(*) FROM @URLs WHERE Mirror = 0) END AS NumberOfDirectories,
            CAST(@MinBackupSizeForMultipleFiles AS bigint) * 1024 * 1024 AS MinBackupSizeForMultipleFiles,
            CAST(@MaxFileSize AS bigint) * 1024 * 1024 AS MaxFileSize
     )
-    SELECT @CurrentNumberOfFiles = CASE WHEN @NumberOfFiles IS NULL AND @BackupSoftware = 'DATA_DOMAIN_BOOST' THEN 1
+    SELECT @CurrentNumberOfFiles = CASE WHEN @NumberOfFiles IS NULL AND @BackupSoftware IN('DATA_DOMAIN_BOOST','PURESTORAGE_SNAPSHOT') THEN 1
                                         WHEN @NumberOfFiles IS NULL AND @MaxFileSize IS NULL THEN NumberOfDirectories
                                         WHEN @NumberOfFiles = 1 THEN @NumberOfFiles
                                         WHEN @NumberOfFiles > 1 AND (BackupSize >= MinBackupSizeForMultipleFiles OR MinBackupSizeForMultipleFiles IS NULL OR BackupSize IS NULL) THEN @NumberOfFiles
@@ -3338,10 +3694,32 @@ BEGIN
 
     IF @CurrentAvailabilityGroup IS NOT NULL
     BEGIN
+      IF ((@CurrentBackupType = 'FULL' AND @CopyOnly = 'N' AND @Version >= 17)
+      OR (@CurrentBackupType = 'DIFF' AND @CopyOnly = 'N' AND @Version >= 17)
+      OR (@CurrentBackupType = 'FULL' AND @CopyOnly = 'Y')
+      OR (@CurrentBackupType = 'LOG' AND @CopyOnly = 'N')
+      OR (@CurrentBackupType = 'SNAPSHOT'))
+      BEGIN
+        SET @CurrentBackupOperationSupportedOnSecondaryReplicas = 1
+      END
+      ELSE
+      BEGIN
+        SET @CurrentBackupOperationSupportedOnSecondaryReplicas = 0
+      END
+    END
+
+    IF @CurrentAvailabilityGroup IS NOT NULL
+    BEGIN
       SET @DatabaseMessage = 'Availability group: ' + ISNULL(@CurrentAvailabilityGroup,'N/A')
       RAISERROR('%s',10,1,@DatabaseMessage) WITH NOWAIT
 
       SET @DatabaseMessage = 'Availability group role: ' + ISNULL(@CurrentAvailabilityGroupRole,'N/A')
+      RAISERROR('%s',10,1,@DatabaseMessage) WITH NOWAIT
+
+      SET @DatabaseMessage = 'Availability group database replica synchronization state: ' + ISNULL(@CurrentAvailabilityGroupDatabaseReplicaSynchronizationState,'N/A')
+      RAISERROR('%s',10,1,@DatabaseMessage) WITH NOWAIT
+
+      SET @DatabaseMessage = 'Availability group database replica synchronization health: ' + ISNULL(@CurrentAvailabilityGroupDatabaseReplicaSynchronizationHealth,'N/A')
       RAISERROR('%s',10,1,@DatabaseMessage) WITH NOWAIT
 
       SET @DatabaseMessage = 'Availability group backup preference: ' + ISNULL(@CurrentAvailabilityGroupBackupPreference,'N/A')
@@ -3349,6 +3727,12 @@ BEGIN
 
       SET @DatabaseMessage = 'Is preferred backup replica: ' + CASE WHEN @CurrentIsPreferredBackupReplica = 1 THEN 'Yes' WHEN @CurrentIsPreferredBackupReplica = 0 THEN 'No' ELSE 'N/A' END
       RAISERROR('%s',10,1,@DatabaseMessage) WITH NOWAIT
+
+      IF @CurrentAvailabilityGroupBackupPreference IN('SECONDARY', 'SECONDARY_ONLY')
+      BEGIN
+        SET @DatabaseMessage = 'Is backup operation supported on secondary replicas: ' + CASE WHEN @CurrentBackupOperationSupportedOnSecondaryReplicas = 1 THEN 'Yes' WHEN @CurrentBackupOperationSupportedOnSecondaryReplicas = 0 THEN 'No' ELSE 'N/A' END
+        RAISERROR('%s',10,1,@DatabaseMessage) WITH NOWAIT
+      END
     END
 
     IF @CurrentDatabaseMirroringRole IS NOT NULL
@@ -3402,11 +3786,8 @@ BEGIN
     AND NOT (@CurrentBackupType = 'LOG' AND @CurrentRecoveryModel IN('FULL','BULK_LOGGED') AND @CurrentLogLSN IS NULL)
     AND NOT (@CurrentBackupType = 'DIFF' AND @CurrentDifferentialBaseLSN IS NULL)
     AND NOT (@CurrentBackupType IN('DIFF','LOG') AND @CurrentDatabaseName = 'master')
-    AND NOT (@CurrentAvailabilityGroup IS NOT NULL AND @CurrentBackupType = 'FULL' AND @CopyOnly = 'N' AND (@CurrentAvailabilityGroupRole <> 'PRIMARY' OR @CurrentAvailabilityGroupRole IS NULL))
-    AND NOT (@CurrentAvailabilityGroup IS NOT NULL AND @CurrentBackupType = 'FULL' AND @CopyOnly = 'Y' AND (@CurrentIsPreferredBackupReplica <> 1 OR @CurrentIsPreferredBackupReplica IS NULL) AND @OverrideBackupPreference = 'N')
-    AND NOT (@CurrentAvailabilityGroup IS NOT NULL AND @CurrentBackupType = 'DIFF' AND (@CurrentAvailabilityGroupRole <> 'PRIMARY' OR @CurrentAvailabilityGroupRole IS NULL))
-    AND NOT (@CurrentAvailabilityGroup IS NOT NULL AND @CurrentBackupType = 'LOG' AND @CopyOnly = 'N' AND (@CurrentIsPreferredBackupReplica <> 1 OR @CurrentIsPreferredBackupReplica IS NULL) AND @OverrideBackupPreference = 'N')
-    AND NOT (@CurrentAvailabilityGroup IS NOT NULL AND @CurrentBackupType = 'LOG' AND @CopyOnly = 'Y' AND (@CurrentAvailabilityGroupRole <> 'PRIMARY' OR @CurrentAvailabilityGroupRole IS NULL))
+    AND NOT (@CurrentAvailabilityGroup IS NOT NULL AND @CurrentBackupOperationSupportedOnSecondaryReplicas = 0 AND (@CurrentAvailabilityGroupRole <> 'PRIMARY' OR @CurrentAvailabilityGroupRole IS NULL))
+    AND NOT (@CurrentAvailabilityGroup IS NOT NULL AND @CurrentBackupOperationSupportedOnSecondaryReplicas = 1 AND (@CurrentIsPreferredBackupReplica <> 1 OR @CurrentIsPreferredBackupReplica IS NULL) AND @OverrideBackupPreference = 'N')
     AND NOT ((@CurrentLogShippingRole = 'PRIMARY' AND @CurrentLogShippingRole IS NOT NULL) AND @CurrentBackupType = 'LOG' AND @ExcludeLogShippedFromLogBackup = 'Y')
     AND NOT (@CurrentIsReadOnly = 1 AND @Updateability = 'READ_WRITE')
     AND NOT (@CurrentIsReadOnly = 0 AND @Updateability = 'READ_ONLY')
@@ -3762,6 +4143,7 @@ BEGIN
       WHEN @CurrentBackupType = 'FULL' THEN @FileExtensionFull
       WHEN @CurrentBackupType = 'DIFF' THEN @FileExtensionDiff
       WHEN @CurrentBackupType = 'LOG' THEN @FileExtensionLog
+      WHEN @CurrentBackupType = 'SNAPSHOT' THEN 'bkm'
       END
 
       -- File name - replace tokens with real values
@@ -4397,6 +4779,176 @@ BEGIN
           SET @CurrentCommand += ' IF @ReturnCode <> 0 RAISERROR(''Error performing Data Domain Boost backup.'', 16, 1)'
         END
 
+        IF @BackupSoftware = 'PURESTORAGE_SNAPSHOT'
+        BEGIN
+          SET @CurrentDatabaseContext = @CurrentDatabaseName
+          SET @CurrentCommandType = 'PURESTORAGE_SNAPSHOT'
+
+          IF @SnapshotTaken = 1 AND @SnapshotMode IN ('GROUP','SERVER')
+          BEGIN
+            -- Multi-database mode: Snapshot already taken, just do metadata-only backup
+            
+            -- For SERVER mode, BACKUP SERVER should only run once (it backs up all databases)
+            IF @SnapshotMode = 'SERVER' AND @ServerBackupDone = 1
+            BEGIN
+              -- Log that this database was included in the SERVER snapshot
+              SET @CurrentCommand = 'PRINT ''Database [' + REPLACE(@CurrentDatabaseName,'''','''''') + '] included in SERVER snapshot: ' + ISNULL(@SnapshotName,'UNKNOWN') + ''';'
+            END
+            ELSE IF @SnapshotMode = 'SERVER'
+            BEGIN
+              -- BACKUP SERVER for all user databases (runs once)
+              SET @CurrentCommand = 'PRINT ''Taking metadata-only backup for all databases in SERVER snapshot mode...'';'
+              SET @CurrentCommand += ' BACKUP SERVER TO DISK=N'''
+              SELECT @CurrentCommand += REPLACE(FilePath,'''','''''')
+              FROM @CurrentFiles
+              WHERE Mirror = 0
+              ORDER BY FilePath ASC
+
+              SET @CurrentCommand += ''' WITH METADATA_ONLY, FORMAT'
+              
+              IF @Description IS NOT NULL 
+                SET @CurrentCommand += ', MEDIADESCRIPTION=N''' + REPLACE(@Description,'''','''''') + ' - Snapshot: ' + ISNULL(@SnapshotName,'UNKNOWN') + ''''
+              ELSE IF @SnapshotName IS NOT NULL
+                SET @CurrentCommand += ', MEDIADESCRIPTION=N''' + @SnapshotName + ''''
+              
+              SET @CurrentCommand += '; PRINT ''Metadata-only backup completed for all databases'';'
+              SET @ServerBackupDone = 1
+            END
+            ELSE
+            BEGIN
+              -- GROUP mode: BACKUP DATABASE for this specific database
+              SET @CurrentCommand = 'PRINT ''Taking metadata-only backup for database in GROUP snapshot mode...'';'
+              SET @CurrentCommand += ' BACKUP DATABASE [' + REPLACE(@CurrentDatabaseName,']',']]') + '] TO DISK=N'''
+              SELECT @CurrentCommand += REPLACE(FilePath,'''','''''')
+              FROM @CurrentFiles
+              WHERE Mirror = 0
+              ORDER BY FilePath ASC
+
+              SET @CurrentCommand += ''' WITH METADATA_ONLY'
+              
+              IF @Description IS NOT NULL 
+                SET @CurrentCommand += ', MEDIADESCRIPTION=N''' + REPLACE(@Description,'''','''''') + ' - Snapshot: ' + ISNULL(@SnapshotName,'UNKNOWN') + ''''
+              ELSE IF @SnapshotName IS NOT NULL
+                SET @CurrentCommand += ', MEDIADESCRIPTION=N''' + @SnapshotName + ''''
+              
+              SET @CurrentCommand += '; PRINT ''Metadata-only backup completed for ' + REPLACE(@CurrentDatabaseName,'''','''''') + ''';'
+            END
+          END
+          ELSE
+          BEGIN
+            -- SINGLE mode: Original per-database snapshot behavior
+            -- Build command with proper error handling
+            SET @CurrentCommand = 'DECLARE @ret INT, @response NVARCHAR(MAX), @AuthToken NVARCHAR(MAX), @MyHeaders NVARCHAR(MAX);'
+            SET @CurrentCommand += ' DECLARE @SnapshotName NVARCHAR(255), @ErrorMessage NVARCHAR(MAX);'
+            SET @CurrentCommand += ' DECLARE @InstanceName NVARCHAR(128) = REPLACE(@@SERVERNAME, ''\\'', ''_'');'
+            SET @CurrentCommand += ' DECLARE @DateStamp NVARCHAR(20) = REPLACE(CONVERT(NVARCHAR, GETDATE(), 112) + ''_'' + REPLACE(CONVERT(NVARCHAR, GETDATE(), 108), '':'', ''''), '' '', ''_'');'
+
+            SET @CurrentCommand += ' BEGIN TRY'
+
+            -- Login to Pure Storage array
+            SET @CurrentCommand += ' EXEC @ret = sp_invoke_external_rest_endpoint'
+            SET @CurrentCommand += ' @url = N''' + REPLACE(@PureStorageArrayURL,'''','''''') + '/login'','
+            SET @CurrentCommand += ' @headers = N''{"api-token":"' + REPLACE(@PureStorageAPIToken,'''','''''') + '"}'','
+            SET @CurrentCommand += ' @response = @response OUTPUT;'
+
+            SET @CurrentCommand += ' PRINT ''Login Return Code: '' + CAST(@ret AS NVARCHAR(10));'
+            SET @CurrentCommand += ' IF ( @ret <> 0 ) BEGIN'
+            SET @CurrentCommand += ' SET @ErrorMessage = ''Error logging in to Pure Storage array. Return code: '' + CAST(@ret AS NVARCHAR(10));'
+            SET @CurrentCommand += ' RAISERROR(@ErrorMessage, 16, 1); RETURN; END'
+
+            -- Extract auth token and build headers
+            SET @CurrentCommand += ' SET @AuthToken = JSON_VALUE(@response, ''$.response.headers."x-auth-token"'');'
+            SET @CurrentCommand += ' IF ( @AuthToken IS NULL OR @AuthToken = '''' ) BEGIN'
+            SET @CurrentCommand += ' RAISERROR(''Failed to extract authentication token from response'', 16, 1); RETURN; END'
+            
+            SET @CurrentCommand += ' SET @MyHeaders = N''{"x-auth-token":"'' + @AuthToken + ''", "Content-Type":"application/json"}'';'
+            SET @CurrentCommand += ' PRINT ''Authentication successful'';'
+
+            -- Suspend database for snapshot backup (SINGLE mode)
+            SET @CurrentCommand += ' PRINT ''Suspending database for snapshot backup'';'
+            IF @CopyOnly = 'Y'
+              SET @CurrentCommand += ' ALTER DATABASE [' + REPLACE(@CurrentDatabaseName,']',']]') + '] SET SUSPEND_FOR_SNAPSHOT_BACKUP = ON (MODE = COPY_ONLY);'
+            ELSE
+              SET @CurrentCommand += ' ALTER DATABASE [' + REPLACE(@CurrentDatabaseName,']',']]') + '] SET SUSPEND_FOR_SNAPSHOT_BACKUP = ON;'
+
+            -- Build payload with metadata tags
+            SET @CurrentCommand += ' DECLARE @Payload NVARCHAR(MAX);'
+            SET @CurrentCommand += ' SET @Payload = ''{"source_names": "' + REPLACE(@PureStorageProtectionGroup,'''','''''') + '", "replicate_now": ' + CASE WHEN @PureStorageReplicateNow = 'Y' THEN 'true' ELSE 'false' END + ', "tags": ['' +'
+            SET @CurrentCommand += ' ''{"copyable": true, "key": "DatabaseName", "value": "' + REPLACE(@CurrentDatabaseName,'''','''''') + '"},'' +'
+            SET @CurrentCommand += ' ''{"copyable": true, "key": "SnapshotMode", "value": "SINGLE"},'' +'
+            SET @CurrentCommand += ' ''{"copyable": true, "key": "SQLInstanceName", "value": "'' + @InstanceName + ''"},'' +'
+            SET @CurrentCommand += ' ''{"copyable": true, "key": "BackupTimestamp", "value": "'' + @DateStamp + ''"},'' +'
+            SET @CurrentCommand += ' ''{"copyable": true, "key": "BackupType", "value": "SNAPSHOT"},'' +'
+            SET @CurrentCommand += ' ''{"copyable": true, "key": "BackupSoftware", "value": "Ola_Hallengren_PURESTORAGE_SNAPSHOT"}'''
+
+            IF @Description IS NOT NULL
+              SET @CurrentCommand += ' + '',{"copyable": true, "key": "Description", "value": "' + REPLACE(@Description,'''','''''') + '"}'''
+
+            SET @CurrentCommand += ' + '']}'';'
+
+            -- Take snapshot
+            SET @CurrentCommand += ' PRINT ''Creating Pure Storage snapshot for Protection Group: ' + REPLACE(@PureStorageProtectionGroup,'''','''''') + ''';'
+            SET @CurrentCommand += ' PRINT ''Payload: '' + @Payload;'
+            
+            -- Validate JSON before sending
+            SET @CurrentCommand += ' IF (ISJSON(@Payload) = 0) BEGIN RAISERROR(''Generated payload is not valid JSON'', 16, 1); RETURN; END;'
+            SET @CurrentCommand += ' PRINT ''Payload is valid JSON'';'
+            
+            SET @CurrentCommand += ' EXEC @ret = sp_invoke_external_rest_endpoint'
+            SET @CurrentCommand += ' @url = N''' + REPLACE(@PureStorageArrayURL,'''','''''') + '/protection-group-snapshots'','
+            SET @CurrentCommand += ' @headers = @MyHeaders,'
+            SET @CurrentCommand += ' @payload = @Payload,'
+            SET @CurrentCommand += ' @response = @response OUTPUT;'
+
+            SET @CurrentCommand += ' PRINT ''Snapshot Return Code: '' + CAST(@ret AS NVARCHAR(10));'
+
+            -- Process snapshot result
+            SET @CurrentCommand += ' SET @SnapshotName = JSON_VALUE(@response, ''$.result.items[0].name'');'
+
+            SET @CurrentCommand += ' IF ( @ret = 0 ) BEGIN'
+            SET @CurrentCommand += ' IF ( @SnapshotName IS NULL OR @SnapshotName = '''' ) BEGIN'
+            SET @CurrentCommand += ' ALTER DATABASE [' + REPLACE(@CurrentDatabaseName,']',']]') + '] SET SUSPEND_FOR_SNAPSHOT_BACKUP = OFF;'
+            SET @CurrentCommand += ' RAISERROR(''Failed to extract snapshot name from response'', 16, 1); RETURN; END'
+
+            SET @CurrentCommand += ' PRINT ''Snapshot created successfully. Name: '' + @SnapshotName;'
+
+            -- Build the metadata backup command
+            SELECT @CurrentCommand += ' BACKUP DATABASE [' + REPLACE(@CurrentDatabaseName,']',']]') + '] TO DISK=N''' + REPLACE(FilePath,'''','''''') + ''' WITH METADATA_ONLY'
+            FROM @CurrentFiles
+            WHERE Mirror = 0
+            ORDER BY FilePath ASC
+
+            IF @Description IS NOT NULL 
+              SET @CurrentCommand += ', MEDIADESCRIPTION=''' + REPLACE(@Description,'''','''''') + ' - Snapshot: '' + @SnapshotName'
+            ELSE
+              SET @CurrentCommand += ', MEDIADESCRIPTION=@SnapshotName'
+
+            SET @CurrentCommand += '; PRINT ''Metadata-only backup completed'';'
+            SET @CurrentCommand += ' END'
+
+            SET @CurrentCommand += ' ELSE BEGIN'
+            SET @CurrentCommand += ' ALTER DATABASE [' + REPLACE(@CurrentDatabaseName,']',']]') + '] SET SUSPEND_FOR_SNAPSHOT_BACKUP = OFF;'
+            SET @CurrentCommand += ' SET @ErrorMessage = ''Error creating snapshot. Return code: '' + CAST(@ret AS NVARCHAR(10)) + '', Response: '' + ISNULL(@response, ''NULL'');'
+            SET @CurrentCommand += ' PRINT @ErrorMessage;'
+            SET @CurrentCommand += ' RAISERROR(@ErrorMessage, 16, 1);'
+            SET @CurrentCommand += ' END'
+
+            -- Error handling
+            SET @CurrentCommand += ' END TRY'
+            SET @CurrentCommand += ' BEGIN CATCH'
+            SET @CurrentCommand += ' SET @ErrorMessage = ERROR_MESSAGE();'
+            SET @CurrentCommand += ' PRINT ''Error in snapshot operation: '' + @ErrorMessage;'
+            SET @CurrentCommand += ' IF (DATABASEPROPERTYEX(''' + REPLACE(@CurrentDatabaseName,'''','''''') + ''', ''IsDatabaseSuspendedForSnapshotBackup'') = 1)'
+            SET @CurrentCommand += ' ALTER DATABASE [' + REPLACE(@CurrentDatabaseName,']',']]') + '] SET SUSPEND_FOR_SNAPSHOT_BACKUP = OFF;'
+            SET @CurrentCommand += ' RAISERROR(@ErrorMessage, 16, 1);'
+            SET @CurrentCommand += ' END CATCH'
+
+            -- Final cleanup for SINGLE mode
+            SET @CurrentCommand += ' IF (DATABASEPROPERTYEX(''' + REPLACE(@CurrentDatabaseName,'''','''''') + ''', ''IsDatabaseSuspendedForSnapshotBackup'') = 1)'
+            SET @CurrentCommand += ' ALTER DATABASE [' + REPLACE(@CurrentDatabaseName,']',']]') + '] SET SUSPEND_FOR_SNAPSHOT_BACKUP = OFF;'
+          END
+        END
+
         EXECUTE @CurrentCommandOutput = dbo.CommandExecute @DatabaseContext = @CurrentDatabaseContext, @Command = @CurrentCommand, @CommandType = @CurrentCommandType, @Mode = 1, @DatabaseName = @CurrentDatabaseName, @LogToTable = @LogToTable, @Execute = @Execute
         SET @Error = @@ERROR
         IF @Error <> 0 SET @CurrentCommandOutput = @Error
@@ -4691,10 +5243,13 @@ BEGIN
     SET @CurrentAvailabilityGroupID = NULL
     SET @CurrentAvailabilityGroup = NULL
     SET @CurrentAvailabilityGroupRole = NULL
+    SET @CurrentAvailabilityGroupDatabaseReplicaSynchronizationState = NULL
+    SET @CurrentAvailabilityGroupDatabaseReplicaSynchronizationHealth = NULL
     SET @CurrentAvailabilityGroupBackupPreference = NULL
     SET @CurrentIsPreferredBackupReplica = NULL
     SET @CurrentDatabaseMirroringRole = NULL
     SET @CurrentLogShippingRole = NULL
+    SET @CurrentBackupOperationSupportedOnSecondaryReplicas = NULL
     SET @CurrentLastLogBackup = NULL
     SET @CurrentLogSizeSinceLastLogBackup = NULL
     SET @CurrentAllocatedExtentPageCount = NULL
@@ -4716,6 +5271,58 @@ BEGIN
   END
 
   ----------------------------------------------------------------------------------------------------
+  --// Unsuspend databases after multi-database snapshot (GROUP/SERVER mode)                     //--
+  ----------------------------------------------------------------------------------------------------
+
+  IF @BackupSoftware = 'PURESTORAGE_SNAPSHOT' AND @SnapshotMode IN ('GROUP','SERVER') AND @SnapshotTaken = 1
+  BEGIN
+    BEGIN TRY
+      SET @CurrentMessage = 'Unsuspending databases after multi-database snapshot backup...'
+      RAISERROR('%s',10,1,@CurrentMessage) WITH NOWAIT
+
+      IF @Execute = 'Y'
+      BEGIN
+        IF @SnapshotMode = 'SERVER'
+        BEGIN
+          EXEC sp_executesql N'ALTER SERVER CONFIGURATION SET SUSPEND_FOR_SNAPSHOT_BACKUP = OFF;'
+        END
+        ELSE
+        BEGIN
+          -- GROUP mode: Unsuspend each database individually
+          DECLARE @UnsuspendDBName nvarchar(max)
+          DECLARE @UnsuspendSQL2 nvarchar(max)
+          DECLARE unsuspend_cursor CURSOR FOR
+            SELECT DatabaseName FROM @tmpDatabases WHERE Selected = 1 AND DatabaseType = 'U'
+          OPEN unsuspend_cursor
+          FETCH NEXT FROM unsuspend_cursor INTO @UnsuspendDBName
+          WHILE @@FETCH_STATUS = 0
+          BEGIN
+            BEGIN TRY
+              SET @UnsuspendSQL2 = N'ALTER DATABASE ' + QUOTENAME(@UnsuspendDBName) + ' SET SUSPEND_FOR_SNAPSHOT_BACKUP = OFF;'
+              EXEC sp_executesql @UnsuspendSQL2
+            END TRY
+            BEGIN CATCH
+              -- Ignore errors during unsuspend (database may already be unsuspended)
+            END CATCH
+            FETCH NEXT FROM unsuspend_cursor INTO @UnsuspendDBName
+          END
+          CLOSE unsuspend_cursor
+          DEALLOCATE unsuspend_cursor
+        END
+
+        SET @CurrentMessage = 'All databases unsuspended successfully.'
+        RAISERROR('%s',10,1,@CurrentMessage) WITH NOWAIT
+      END
+    END TRY
+    BEGIN CATCH
+      SET @ErrorMessage = 'Warning: Error unsuspending databases: ' + ERROR_MESSAGE()
+      RAISERROR('%s',10,1,@ErrorMessage) WITH NOWAIT
+    END CATCH
+
+    RAISERROR(@EmptyLine,10,1) WITH NOWAIT
+  END
+
+  ----------------------------------------------------------------------------------------------------
   --// Log completing information                                                                 //--
   ----------------------------------------------------------------------------------------------------
 
@@ -4734,8 +5341,7 @@ BEGIN
 
 END
 GO
-SET ANSI_NULLS ON
-GO
+
 SET QUOTED_IDENTIFIER ON
 GO
 IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[DatabaseIntegrityCheck]') AND type in (N'P', N'PC'))
@@ -4776,7 +5382,7 @@ BEGIN
   --// Source:  https://ola.hallengren.com                                                        //--
   --// License: https://ola.hallengren.com/license.html                                           //--
   --// GitHub:  https://github.com/olahallengren/sql-server-maintenance-solution                  //--
-  --// Version: 2025-06-14 16:13:00                                                               //--
+  --// Version: 2025-12-20 18:52:13                                                               //--
   ----------------------------------------------------------------------------------------------------
 
   SET NOCOUNT ON
@@ -6675,7 +7281,7 @@ BEGIN
   --// Source:  https://ola.hallengren.com                                                        //--
   --// License: https://ola.hallengren.com/license.html                                           //--
   --// GitHub:  https://github.com/olahallengren/sql-server-maintenance-solution                  //--
-  --// Version: 2025-06-14 16:13:00                                                               //--
+  --// Version: 2025-12-20 18:52:13                                                               //--
   ----------------------------------------------------------------------------------------------------
 
   SET NOCOUNT ON
@@ -6759,7 +7365,8 @@ BEGIN
   DECLARE @CurrentIsImageText bit
   DECLARE @CurrentIsNewLOB bit
   DECLARE @CurrentIsFileStream bit
-  DECLARE @CurrentHasColumnstore bit
+  DECLARE @CurrentHasClusteredColumnstore bit
+  DECLARE @CurrentHasNonClusteredColumnstore bit
   DECLARE @CurrentIsComputed bit
   DECLARE @CurrentIsClusteredIndexComputed bit
   DECLARE @CurrentIsTimestamp bit
@@ -6815,7 +7422,8 @@ BEGIN
                                        IsImageText bit,
                                        IsNewLOB bit,
                                        IsFileStream bit,
-                                       HasColumnstore bit,
+                                       HasClusteredColumnstore bit,
+                                       HasNonClusteredColumnstore bit,
                                        IsComputed bit,
                                        IsClusteredIndexComputed bit,
                                        IsTimestamp bit,
@@ -8164,7 +8772,7 @@ BEGIN
       IF (EXISTS(SELECT * FROM @ActionsPreferred) OR @UpdateStatistics IS NOT NULL) AND (SYSDATETIME() < DATEADD(SECOND,@TimeLimit,@StartTime) OR @TimeLimit IS NULL)
       BEGIN
         SET @CurrentCommand = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;'
-                              + ' SELECT SchemaID, SchemaName, ObjectID, ObjectName, ObjectType, IsMemoryOptimized, IndexID, IndexName, IndexType, AllowPageLocks, HasFilter, IsImageText, IsNewLOB, IsFileStream, HasColumnstore, IsComputed, IsClusteredIndexComputed, IsTimestamp, OnReadOnlyFileGroup, ResumableIndexOperation, StatisticsID, StatisticsName, NoRecompute, IsIncremental, PartitionID, PartitionNumber, PartitionCount, [Order], Selected, Completed'
+                              + ' SELECT SchemaID, SchemaName, ObjectID, ObjectName, ObjectType, IsMemoryOptimized, IndexID, IndexName, IndexType, AllowPageLocks, HasFilter, IsImageText, IsNewLOB, IsFileStream, HasClusteredColumnstore, HasNonClusteredColumnstore, IsComputed, IsClusteredIndexComputed, IsTimestamp, OnReadOnlyFileGroup, ResumableIndexOperation, StatisticsID, StatisticsName, NoRecompute, IsIncremental, PartitionID, PartitionNumber, PartitionCount, [Order], Selected, Completed'
                               + ' FROM ('
 
         IF EXISTS(SELECT * FROM @ActionsPreferred) OR @UpdateStatistics IN('ALL','INDEX')
@@ -8188,7 +8796,9 @@ BEGIN
 
                                                     + ', CASE WHEN indexes.[type] = 1 AND EXISTS(SELECT * FROM sys.columns columns WHERE columns.[object_id] = objects.object_id  AND columns.is_filestream = 1) THEN 1 ELSE 0 END AS IsFileStream'
 
-                                                    + ', CASE WHEN EXISTS(SELECT * FROM sys.indexes indexes WHERE indexes.[object_id] = objects.object_id AND [type] IN(5,6)) THEN 1 ELSE 0 END AS HasColumnstore'
+                                                    + ', CASE WHEN EXISTS(SELECT * FROM sys.indexes indexes WHERE indexes.[object_id] = objects.object_id AND [type] = 5) THEN 1 ELSE 0 END AS HasClusteredColumnstore'
+
+                                                    + ', CASE WHEN EXISTS(SELECT * FROM sys.indexes indexes WHERE indexes.[object_id] = objects.object_id AND [type] = 6) THEN 1 ELSE 0 END AS HasNonClusteredColumnstore'
 
                                                     + ', CASE WHEN EXISTS(SELECT * FROM sys.index_columns index_columns INNER JOIN sys.columns columns ON index_columns.object_id = columns.object_id AND index_columns.column_id = columns.column_id WHERE (index_columns.key_ordinal > 0 OR index_columns.partition_ordinal > 0) AND columns.is_computed = 1 AND index_columns.object_id = indexes.object_id AND index_columns.index_id = indexes.index_id) THEN 1 ELSE 0 END AS IsComputed'
 
@@ -8249,7 +8859,8 @@ BEGIN
                                                     + ', NULL AS IsImageText'
                                                     + ', NULL AS IsNewLOB'
                                                     + ', NULL AS IsFileStream'
-                                                    + ', NULL AS HasColumnstore'
+                                                    + ', NULL AS HasClusteredColumnstore'
+                                                    + ', NULL AS HasNonClusteredColumnstore'
                                                     + ', NULL AS IsComputed'
                                                     + ', NULL AS IsClusteredIndexComputed'
                                                     + ', NULL AS IsTimestamp'
@@ -8298,7 +8909,8 @@ BEGIN
                                                       + ', NULL AS IsImageText'
                                                       + ', NULL AS IsNewLOB'
                                                       + ', NULL AS IsFileStream'
-                                                      + ', NULL AS HasColumnstore'
+                                                      + ', NULL AS HasClusteredColumnstore'
+                                                      + ', NULL AS HasNonClusteredColumnstore'
                                                       + ', NULL AS IsComputed'
                                                       + ', NULL AS IsClusteredIndexComputed'
                                                       + ', NULL AS IsTimestamp'
@@ -8328,7 +8940,7 @@ BEGIN
 
         SET @CurrentCommand = @CurrentCommand + ') IndexesStatistics'
 
-        INSERT INTO @tmpIndexesStatistics (SchemaID, SchemaName, ObjectID, ObjectName, ObjectType, IsMemoryOptimized, IndexID, IndexName, IndexType, AllowPageLocks, HasFilter, IsImageText, IsNewLOB, IsFileStream, HasColumnstore, IsComputed, IsClusteredIndexComputed, IsTimestamp, OnReadOnlyFileGroup, ResumableIndexOperation, StatisticsID, StatisticsName, [NoRecompute], IsIncremental, PartitionID, PartitionNumber, PartitionCount, [Order], Selected, Completed)
+        INSERT INTO @tmpIndexesStatistics (SchemaID, SchemaName, ObjectID, ObjectName, ObjectType, IsMemoryOptimized, IndexID, IndexName, IndexType, AllowPageLocks, HasFilter, IsImageText, IsNewLOB, IsFileStream, HasClusteredColumnstore, HasNonClusteredColumnstore, IsComputed, IsClusteredIndexComputed, IsTimestamp, OnReadOnlyFileGroup, ResumableIndexOperation, StatisticsID, StatisticsName, [NoRecompute], IsIncremental, PartitionID, PartitionNumber, PartitionCount, [Order], Selected, Completed)
         EXECUTE @CurrentDatabase_sp_executesql @stmt = @CurrentCommand
         SET @Error = @@ERROR
         IF @Error <> 0
@@ -8432,7 +9044,8 @@ BEGIN
                      @CurrentIsImageText = IsImageText,
                      @CurrentIsNewLOB = IsNewLOB,
                      @CurrentIsFileStream = IsFileStream,
-                     @CurrentHasColumnstore = HasColumnstore,
+                     @CurrentHasClusteredColumnstore = HasClusteredColumnstore,
+                     @CurrentHasNonClusteredColumnstore = HasNonClusteredColumnstore,
                      @CurrentIsComputed = IsComputed,
                      @CurrentIsClusteredIndexComputed = IsClusteredIndexComputed,
                      @CurrentIsTimestamp = IsTimestamp,
@@ -8636,8 +9249,9 @@ BEGIN
           AND NOT (@CurrentIndexType = 4)
           AND NOT (@CurrentIndexType = 5 AND @Version < 15)
           AND NOT (@CurrentIndexType = 6 AND @Version < 14)
-          AND NOT (@CurrentIndexType = 1 AND @CurrentHasColumnstore = 1 AND @Version < 13)
-          AND NOT (@CurrentIndexType = 2 AND @CurrentHasColumnstore = 1 AND @Version < 15)
+          AND NOT (@CurrentIndexType = 1 AND @CurrentHasNonClusteredColumnstore = 1 AND @Version < 13)
+          AND NOT (@CurrentIndexType = 2 AND @CurrentHasClusteredColumnstore = 1 AND @Version < 15)
+          AND NOT (@CurrentIndexType = 2 AND @CurrentHasNonClusteredColumnstore = 1 AND @Version < 13)
           BEGIN
             INSERT INTO @CurrentActionsAllowed ([Action])
             VALUES ('INDEX_REBUILD_ONLINE')
@@ -8725,7 +9339,8 @@ BEGIN
           SET @CurrentComment += 'ImageText: ' + CASE WHEN @CurrentIsImageText = 1 THEN 'Yes' WHEN @CurrentIsImageText = 0 THEN 'No' ELSE 'N/A' END + ', '
           SET @CurrentComment += 'NewLOB: ' + CASE WHEN @CurrentIsNewLOB = 1 THEN 'Yes' WHEN @CurrentIsNewLOB = 0 THEN 'No' ELSE 'N/A' END + ', '
           SET @CurrentComment += 'FileStream: ' + CASE WHEN @CurrentIsFileStream = 1 THEN 'Yes' WHEN @CurrentIsFileStream = 0 THEN 'No' ELSE 'N/A' END + ', '
-          IF @Version >= 11 SET @CurrentComment += 'HasColumnStore: ' + CASE WHEN @CurrentHasColumnstore = 1 THEN 'Yes' WHEN @CurrentHasColumnstore = 0 THEN 'No' ELSE 'N/A' END + ', '
+          IF @Version >= 12 AND @CurrentIndexType NOT IN(5, 6) SET @CurrentComment += 'HasClusteredColumnstore: ' + CASE WHEN @CurrentHasClusteredColumnstore = 1 THEN 'Yes' WHEN @CurrentHasClusteredColumnstore = 0 THEN 'No' ELSE 'N/A' END + ', '
+          IF @Version >= 11 AND @CurrentIndexType NOT IN(5, 6) SET @CurrentComment += 'HasNonClusteredColumnstore: ' + CASE WHEN @CurrentHasNonClusteredColumnstore = 1 THEN 'Yes' WHEN @CurrentHasNonClusteredColumnstore = 0 THEN 'No' ELSE 'N/A' END + ', '
           IF @Version >= 14 AND @Resumable = 'Y' SET @CurrentComment += 'Computed: ' + CASE WHEN @CurrentIsComputed = 1 THEN 'Yes' WHEN @CurrentIsComputed = 0 THEN 'No' ELSE 'N/A' END + ', '
           IF @Version >= 14 AND @Resumable = 'Y' AND @CurrentIndexType = 2 SET @CurrentComment += 'ClusteredIndexComputed: ' + CASE WHEN @CurrentIsClusteredIndexComputed = 1 THEN 'Yes' WHEN @CurrentIsClusteredIndexComputed = 0 THEN 'No' ELSE 'N/A' END + ', '
           IF @Version >= 14 AND @Resumable = 'Y' SET @CurrentComment += 'Timestamp: ' + CASE WHEN @CurrentIsTimestamp = 1 THEN 'Yes' WHEN @CurrentIsTimestamp = 0 THEN 'No' ELSE 'N/A' END + ', '
@@ -9007,7 +9622,8 @@ BEGIN
         SET @CurrentIsImageText = NULL
         SET @CurrentIsNewLOB = NULL
         SET @CurrentIsFileStream = NULL
-        SET @CurrentHasColumnstore = NULL
+        SET @CurrentHasClusteredColumnstore = NULL
+        SET @CurrentHasNonClusteredColumnstore = NULL
         SET @CurrentIsComputed = NULL
         SET @CurrentIsClusteredIndexComputed = NULL
         SET @CurrentIsTimestamp = NULL
@@ -9464,4 +10080,3 @@ BEGIN
   DEALLOCATE JobCursor
 END
 GO
-
