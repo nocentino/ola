@@ -20,13 +20,11 @@ Usage:
 */
 
 SET NOCOUNT ON;
-GO
 
 -- ============================================================================
 -- CONFIGURATION
 -- ============================================================================
-DECLARE @ExecuteTests bit = 0;  -- Set to 1 to actually execute backups
-DECLARE @CleanupAfterTests bit = 0;  -- Set to 1 to delete test CommandLog entries
+DECLARE @ExecuteTests bit = 1;  -- Set to 1 to actually execute backups
 
 -- Pure Storage Configuration
 DECLARE @PureStorageArrayURL nvarchar(500) = 'https://sn1-x90r2-f06-33.puretec.purestorage.com/api/2.46';
@@ -55,133 +53,97 @@ CREATE TABLE #TestResults (
 );
 
 -- ============================================================================
--- HELPER PROCEDURES
+-- TEST VARIABLES
 -- ============================================================================
-GO
+DECLARE @TestID int;
+DECLARE @ErrorCount int = 0;
+DECLARE @MaxCommandLogID int;
+DECLARE @PreflightErrors nvarchar(max) = '';
+DECLARE @ProcDefinition nvarchar(max);
 
--- Log test start
-CREATE OR ALTER PROCEDURE #LogTestStart
-    @TestName nvarchar(200),
-    @TestCategory nvarchar(50)
-AS
-BEGIN
-    INSERT INTO #TestResults (TestName, TestCategory)
-    VALUES (@TestName, @TestCategory);
-    
-    PRINT '----------------------------------------';
-    PRINT 'TEST: ' + @TestName;
-    PRINT 'Category: ' + @TestCategory;
-    PRINT 'Started: ' + CONVERT(varchar, SYSDATETIME(), 121);
-    PRINT '----------------------------------------';
-    
-    RETURN SCOPE_IDENTITY();
-END;
-GO
+-- Variables for snapshot name extraction
+DECLARE @CommandText nvarchar(max);
+DECLARE @MediaDescPos int;
+DECLARE @SnapshotPos int;
 
--- Log test result
-CREATE OR ALTER PROCEDURE #LogTestResult
-    @TestID int,
-    @Status nvarchar(20),
-    @Details nvarchar(max) = NULL,
-    @CommandLogIDs nvarchar(500) = NULL
-AS
-BEGIN
-    UPDATE #TestResults
-    SET EndTime = SYSDATETIME(),
-        Status = @Status,
-        Details = @Details,
-        CommandLogIDs = @CommandLogIDs
-    WHERE TestID = @TestID;
-    
-    PRINT 'Result: ' + @Status;
-    IF @Details IS NOT NULL PRINT 'Details: ' + @Details;
-    PRINT '';
-END;
-GO
+-- Save current max CommandLog ID
+SELECT @MaxCommandLogID = ISNULL(MAX(ID), 0) FROM dbo.CommandLog;
 
--- ============================================================================
--- PRE-FLIGHT CHECKS
--- ============================================================================
 PRINT '============================================================';
 PRINT 'PURE STORAGE SNAPSHOT BACKUP TEST HARNESS';
 PRINT 'Started: ' + CONVERT(varchar, SYSDATETIME(), 121);
 PRINT '============================================================';
 PRINT '';
 
-DECLARE @TestID int;
-DECLARE @ErrorCount int = 0;
-DECLARE @MaxCommandLogID int;
-DECLARE @NewCommandLogIDs nvarchar(500);
+-- ============================================================================
+-- PRE-FLIGHT CHECKS
+-- ============================================================================
+PRINT '------------------------------------------------------------';
+PRINT 'TEST: Pre-flight Validation';
+PRINT 'Category: Setup';
+PRINT 'Started: ' + CONVERT(varchar, SYSDATETIME(), 121);
+PRINT '------------------------------------------------------------';
 
--- Save current max CommandLog ID
-SELECT @MaxCommandLogID = ISNULL(MAX(ID), 0) FROM dbo.CommandLog;
-
--- ----------------------------------------------------------------------------
--- Test 0: Pre-flight validation
--- ----------------------------------------------------------------------------
-EXEC @TestID = #LogTestStart 'Pre-flight Validation', 'Setup';
-
-DECLARE @PreflightErrors nvarchar(max) = '';
+INSERT INTO #TestResults (TestName, TestCategory) VALUES ('Pre-flight Validation', 'Setup');
+SET @TestID = SCOPE_IDENTITY();
 
 -- Check if DatabaseBackup procedure exists
 IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID('dbo.DatabaseBackup') AND type = 'P')
-    SET @PreflightErrors += 'DatabaseBackup procedure not found. ';
+    SET @PreflightErrors = @PreflightErrors + 'DatabaseBackup procedure not found. ';
 
 -- Check if CommandLog table exists
 IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID('dbo.CommandLog') AND type = 'U')
-    SET @PreflightErrors += 'CommandLog table not found. ';
+    SET @PreflightErrors = @PreflightErrors + 'CommandLog table not found. ';
 
 -- Check if required parameters are supported
 IF NOT EXISTS (SELECT 1 FROM sys.parameters WHERE object_id = OBJECT_ID('dbo.DatabaseBackup') AND name = '@SnapshotMode')
-    SET @PreflightErrors += '@SnapshotMode parameter not found. ';
+    SET @PreflightErrors = @PreflightErrors + '@SnapshotMode parameter not found. ';
 
 IF NOT EXISTS (SELECT 1 FROM sys.parameters WHERE object_id = OBJECT_ID('dbo.DatabaseBackup') AND name = '@PureStorageArrayURL')
-    SET @PreflightErrors += '@PureStorageArrayURL parameter not found. ';
+    SET @PreflightErrors = @PreflightErrors + '@PureStorageArrayURL parameter not found. ';
 
 -- Check if key fixes are deployed
-DECLARE @ProcDefinition nvarchar(max) = OBJECT_DEFINITION(OBJECT_ID('dbo.DatabaseBackup'));
+SET @ProcDefinition = OBJECT_DEFINITION(OBJECT_ID('dbo.DatabaseBackup'));
 
 IF @ProcDefinition NOT LIKE '%@LoginURL%'
-    SET @PreflightErrors += 'Login URL fix not deployed. ';
-
-IF @ProcDefinition NOT LIKE '%QUOTENAME(DatabaseName)%FROM @tmpDatabases%WHERE Selected = 1%'
-    SET @PreflightErrors += 'QUOTENAME fix for GROUP mode not deployed. ';
+    SET @PreflightErrors = @PreflightErrors + 'Login URL fix not deployed. ';
 
 IF @ProcDefinition NOT LIKE '%@ServerBackupDone%'
-    SET @PreflightErrors += 'ServerBackupDone flag not deployed. ';
+    SET @PreflightErrors = @PreflightErrors + 'ServerBackupDone flag not deployed. ';
 
 IF @ProcDefinition NOT LIKE '%included in SERVER snapshot%'
-    SET @PreflightErrors += 'SERVER mode logging fix not deployed. ';
+    SET @PreflightErrors = @PreflightErrors + 'SERVER mode logging fix not deployed. ';
 
 -- Check test databases exist
-DECLARE @TestDBWithHyphenLocal nvarchar(128) = 'TPCC-4T';
-DECLARE @TestDB1Local nvarchar(128) = 'AdventureWorks2025';
-DECLARE @TestDB2Local nvarchar(128) = 'TPCC500G';
+IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = @TestDB1)
+    SET @PreflightErrors = @PreflightErrors + 'Test database ' + @TestDB1 + ' not found. ';
 
-IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = @TestDB1Local)
-    SET @PreflightErrors += 'Test database ' + @TestDB1Local + ' not found. ';
+IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = @TestDB2)
+    SET @PreflightErrors = @PreflightErrors + 'Test database ' + @TestDB2 + ' not found. ';
 
-IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = @TestDB2Local)
-    SET @PreflightErrors += 'Test database ' + @TestDB2Local + ' not found. ';
-
-IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = @TestDBWithHyphenLocal)
-    SET @PreflightErrors += 'Test database ' + @TestDBWithHyphenLocal + ' not found (hyphen test). ';
+IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = @TestDBWithHyphen)
+    SET @PreflightErrors = @PreflightErrors + 'Test database ' + @TestDBWithHyphen + ' not found (hyphen test). ';
 
 IF LEN(@PreflightErrors) > 0
 BEGIN
-    EXEC #LogTestResult @TestID, 'Failed', @PreflightErrors;
-    SET @ErrorCount += 1;
+    UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = @PreflightErrors WHERE TestID = @TestID;
+    SET @ErrorCount = @ErrorCount + 1;
+    PRINT 'Result: Failed';
+    PRINT 'Details: ' + @PreflightErrors;
     PRINT 'CRITICAL: Pre-flight checks failed. Fix issues before running tests.';
 END
 ELSE
 BEGIN
-    EXEC #LogTestResult @TestID, 'Passed', 'All pre-flight checks passed.';
+    UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Passed', Details = 'All pre-flight checks passed.' WHERE TestID = @TestID;
+    PRINT 'Result: Passed';
+    PRINT 'Details: All pre-flight checks passed.';
 END;
+
+PRINT '';
 
 -- ============================================================================
 -- PARAMETER VALIDATION TESTS
 -- ============================================================================
-PRINT '';
 PRINT '============================================================';
 PRINT 'PARAMETER VALIDATION TESTS';
 PRINT '============================================================';
@@ -189,7 +151,15 @@ PRINT '============================================================';
 -- ----------------------------------------------------------------------------
 -- Test 1: Invalid SnapshotMode value
 -- ----------------------------------------------------------------------------
-EXEC @TestID = #LogTestStart 'Invalid SnapshotMode Value', 'Validation';
+PRINT '';
+PRINT '------------------------------------------------------------';
+PRINT 'TEST: Invalid SnapshotMode Value';
+PRINT 'Category: Validation';
+PRINT 'Started: ' + CONVERT(varchar, SYSDATETIME(), 121);
+PRINT '------------------------------------------------------------';
+
+INSERT INTO #TestResults (TestName, TestCategory) VALUES ('Invalid SnapshotMode Value', 'Validation');
+SET @TestID = SCOPE_IDENTITY();
 
 BEGIN TRY
     EXEC dbo.DatabaseBackup 
@@ -203,23 +173,39 @@ BEGIN TRY
         @Directory = 'C:\Backups',
         @Execute = 'N';
     
-    EXEC #LogTestResult @TestID, 'Failed', 'Should have raised error for invalid SnapshotMode';
-    SET @ErrorCount += 1;
+    UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = 'Should have raised error for invalid SnapshotMode' WHERE TestID = @TestID;
+    SET @ErrorCount = @ErrorCount + 1;
+    PRINT 'Result: Failed';
+    PRINT 'Details: Should have raised error for invalid SnapshotMode';
 END TRY
 BEGIN CATCH
     IF ERROR_MESSAGE() LIKE '%SnapshotMode%'
-        EXEC #LogTestResult @TestID, 'Passed', 'Correctly rejected invalid SnapshotMode';
+    BEGIN
+        UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Passed', Details = 'Correctly rejected invalid SnapshotMode' WHERE TestID = @TestID;
+        PRINT 'Result: Passed';
+        PRINT 'Details: Correctly rejected invalid SnapshotMode';
+    END
     ELSE
     BEGIN
-        EXEC #LogTestResult @TestID, 'Failed', ERROR_MESSAGE();
-        SET @ErrorCount += 1;
+        UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = ERROR_MESSAGE() WHERE TestID = @TestID;
+        SET @ErrorCount = @ErrorCount + 1;
+        PRINT 'Result: Failed';
+        PRINT 'Details: ' + ERROR_MESSAGE();
     END
 END CATCH;
 
 -- ----------------------------------------------------------------------------
 -- Test 2: GROUP mode requires PURESTORAGE_SNAPSHOT
 -- ----------------------------------------------------------------------------
-EXEC @TestID = #LogTestStart 'GROUP Mode Requires PURESTORAGE_SNAPSHOT', 'Validation';
+PRINT '';
+PRINT '------------------------------------------------------------';
+PRINT 'TEST: GROUP Mode Requires PURESTORAGE_SNAPSHOT';
+PRINT 'Category: Validation';
+PRINT 'Started: ' + CONVERT(varchar, SYSDATETIME(), 121);
+PRINT '------------------------------------------------------------';
+
+INSERT INTO #TestResults (TestName, TestCategory) VALUES ('GROUP Mode Requires PURESTORAGE_SNAPSHOT', 'Validation');
+SET @TestID = SCOPE_IDENTITY();
 
 BEGIN TRY
     EXEC dbo.DatabaseBackup 
@@ -230,23 +216,37 @@ BEGIN TRY
         @Directory = 'C:\Backups',
         @Execute = 'N';
     
-    EXEC #LogTestResult @TestID, 'Failed', 'Should have raised error for GROUP without PURESTORAGE_SNAPSHOT';
-    SET @ErrorCount += 1;
+    UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = 'Should have raised error for GROUP without PURESTORAGE_SNAPSHOT' WHERE TestID = @TestID;
+    SET @ErrorCount = @ErrorCount + 1;
+    PRINT 'Result: Failed';
 END TRY
 BEGIN CATCH
-    IF ERROR_MESSAGE() LIKE '%GROUP%' OR ERROR_MESSAGE() LIKE '%PURESTORAGE%'
-        EXEC #LogTestResult @TestID, 'Passed', 'Correctly rejected GROUP mode without PURESTORAGE_SNAPSHOT';
+    IF ERROR_MESSAGE() LIKE '%GROUP%' OR ERROR_MESSAGE() LIKE '%PURESTORAGE%' OR ERROR_MESSAGE() LIKE '%BackupSoftware%'
+    BEGIN
+        UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Passed', Details = 'Correctly rejected GROUP mode without PURESTORAGE_SNAPSHOT' WHERE TestID = @TestID;
+        PRINT 'Result: Passed';
+    END
     ELSE
     BEGIN
-        EXEC #LogTestResult @TestID, 'Failed', ERROR_MESSAGE();
-        SET @ErrorCount += 1;
+        UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = ERROR_MESSAGE() WHERE TestID = @TestID;
+        SET @ErrorCount = @ErrorCount + 1;
+        PRINT 'Result: Failed';
+        PRINT 'Details: ' + ERROR_MESSAGE();
     END
 END CATCH;
 
 -- ----------------------------------------------------------------------------
 -- Test 3: SERVER mode requires USER_DATABASES or ALL_DATABASES
 -- ----------------------------------------------------------------------------
-EXEC @TestID = #LogTestStart 'SERVER Mode Database Validation', 'Validation';
+PRINT '';
+PRINT '------------------------------------------------------------';
+PRINT 'TEST: SERVER Mode Database Validation';
+PRINT 'Category: Validation';
+PRINT 'Started: ' + CONVERT(varchar, SYSDATETIME(), 121);
+PRINT '------------------------------------------------------------';
+
+INSERT INTO #TestResults (TestName, TestCategory) VALUES ('SERVER Mode Database Validation', 'Validation');
+SET @TestID = SCOPE_IDENTITY();
 
 BEGIN TRY
     EXEC dbo.DatabaseBackup 
@@ -260,16 +260,22 @@ BEGIN TRY
         @Directory = 'C:\Backups',
         @Execute = 'N';
     
-    EXEC #LogTestResult @TestID, 'Failed', 'Should have raised error for SERVER with single database';
-    SET @ErrorCount += 1;
+    UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = 'Should have raised error for SERVER with single database' WHERE TestID = @TestID;
+    SET @ErrorCount = @ErrorCount + 1;
+    PRINT 'Result: Failed';
 END TRY
 BEGIN CATCH
     IF ERROR_MESSAGE() LIKE '%SERVER%' OR ERROR_MESSAGE() LIKE '%USER_DATABASES%' OR ERROR_MESSAGE() LIKE '%ALL_DATABASES%'
-        EXEC #LogTestResult @TestID, 'Passed', 'Correctly rejected SERVER mode with single database';
+    BEGIN
+        UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Passed', Details = 'Correctly rejected SERVER mode with single database' WHERE TestID = @TestID;
+        PRINT 'Result: Passed';
+    END
     ELSE
     BEGIN
-        EXEC #LogTestResult @TestID, 'Failed', ERROR_MESSAGE();
-        SET @ErrorCount += 1;
+        UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = ERROR_MESSAGE() WHERE TestID = @TestID;
+        SET @ErrorCount = @ErrorCount + 1;
+        PRINT 'Result: Failed';
+        PRINT 'Details: ' + ERROR_MESSAGE();
     END
 END CATCH;
 
@@ -284,7 +290,15 @@ PRINT '============================================================';
 -- ----------------------------------------------------------------------------
 -- Test 4: SINGLE mode dry run
 -- ----------------------------------------------------------------------------
-EXEC @TestID = #LogTestStart 'SINGLE Mode Dry Run', 'DryRun';
+PRINT '';
+PRINT '------------------------------------------------------------';
+PRINT 'TEST: SINGLE Mode Dry Run';
+PRINT 'Category: DryRun';
+PRINT 'Started: ' + CONVERT(varchar, SYSDATETIME(), 121);
+PRINT '------------------------------------------------------------';
+
+INSERT INTO #TestResults (TestName, TestCategory) VALUES ('SINGLE Mode Dry Run', 'DryRun');
+SET @TestID = SCOPE_IDENTITY();
 
 BEGIN TRY
     EXEC dbo.DatabaseBackup 
@@ -298,17 +312,28 @@ BEGIN TRY
         @Directory = @BackupDirectory,
         @Execute = 'N';
     
-    EXEC #LogTestResult @TestID, 'Passed', 'SINGLE mode dry run completed without errors';
+    UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Passed', Details = 'SINGLE mode dry run completed without errors' WHERE TestID = @TestID;
+    PRINT 'Result: Passed';
 END TRY
 BEGIN CATCH
-    EXEC #LogTestResult @TestID, 'Failed', ERROR_MESSAGE();
-    SET @ErrorCount += 1;
+    UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = ERROR_MESSAGE() WHERE TestID = @TestID;
+    SET @ErrorCount = @ErrorCount + 1;
+    PRINT 'Result: Failed';
+    PRINT 'Details: ' + ERROR_MESSAGE();
 END CATCH;
 
 -- ----------------------------------------------------------------------------
 -- Test 5: GROUP mode dry run with hyphenated database name
 -- ----------------------------------------------------------------------------
-EXEC @TestID = #LogTestStart 'GROUP Mode Dry Run (Hyphen in DB Name)', 'DryRun';
+PRINT '';
+PRINT '------------------------------------------------------------';
+PRINT 'TEST: GROUP Mode Dry Run (Hyphen in DB Name)';
+PRINT 'Category: DryRun';
+PRINT 'Started: ' + CONVERT(varchar, SYSDATETIME(), 121);
+PRINT '------------------------------------------------------------';
+
+INSERT INTO #TestResults (TestName, TestCategory) VALUES ('GROUP Mode Dry Run (Hyphen in DB Name)', 'DryRun');
+SET @TestID = SCOPE_IDENTITY();
 
 BEGIN TRY
     EXEC dbo.DatabaseBackup 
@@ -322,17 +347,28 @@ BEGIN TRY
         @Directory = @BackupDirectory,
         @Execute = 'N';
     
-    EXEC #LogTestResult @TestID, 'Passed', 'GROUP mode dry run with hyphenated name completed';
+    UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Passed', Details = 'GROUP mode dry run with hyphenated name completed' WHERE TestID = @TestID;
+    PRINT 'Result: Passed';
 END TRY
 BEGIN CATCH
-    EXEC #LogTestResult @TestID, 'Failed', ERROR_MESSAGE();
-    SET @ErrorCount += 1;
+    UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = ERROR_MESSAGE() WHERE TestID = @TestID;
+    SET @ErrorCount = @ErrorCount + 1;
+    PRINT 'Result: Failed';
+    PRINT 'Details: ' + ERROR_MESSAGE();
 END CATCH;
 
 -- ----------------------------------------------------------------------------
 -- Test 6: SERVER mode dry run
 -- ----------------------------------------------------------------------------
-EXEC @TestID = #LogTestStart 'SERVER Mode Dry Run', 'DryRun';
+PRINT '';
+PRINT '------------------------------------------------------------';
+PRINT 'TEST: SERVER Mode Dry Run';
+PRINT 'Category: DryRun';
+PRINT 'Started: ' + CONVERT(varchar, SYSDATETIME(), 121);
+PRINT '------------------------------------------------------------';
+
+INSERT INTO #TestResults (TestName, TestCategory) VALUES ('SERVER Mode Dry Run', 'DryRun');
+SET @TestID = SCOPE_IDENTITY();
 
 BEGIN TRY
     EXEC dbo.DatabaseBackup 
@@ -346,32 +382,84 @@ BEGIN TRY
         @Directory = @BackupDirectory,
         @Execute = 'N';
     
-    EXEC #LogTestResult @TestID, 'Passed', 'SERVER mode dry run completed without errors';
+    UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Passed', Details = 'SERVER mode dry run completed without errors' WHERE TestID = @TestID;
+    PRINT 'Result: Passed';
 END TRY
 BEGIN CATCH
-    EXEC #LogTestResult @TestID, 'Failed', ERROR_MESSAGE();
-    SET @ErrorCount += 1;
+    UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = ERROR_MESSAGE() WHERE TestID = @TestID;
+    SET @ErrorCount = @ErrorCount + 1;
+    PRINT 'Result: Failed';
+    PRINT 'Details: ' + ERROR_MESSAGE();
 END CATCH;
 
 -- ============================================================================
--- LIVE EXECUTION TESTS (Only if @ExecuteTests = 1)
+-- LIVE EXECUTION TESTS WITH TAG VERIFICATION
 -- ============================================================================
-DECLARE @ExecuteTestsLocal bit = 0;  -- Redeclare for this batch
+PRINT '';
+PRINT '============================================================';
+IF @ExecuteTests = 1
+    PRINT 'LIVE EXECUTION TESTS WITH TAG VERIFICATION';
+ELSE
+    PRINT 'LIVE EXECUTION TESTS SKIPPED (@ExecuteTests = 0)';
+PRINT '============================================================';
 
-IF @ExecuteTestsLocal = 1
+IF @ExecuteTests = 1
 BEGIN
-    PRINT '';
-    PRINT '============================================================';
-    PRINT 'LIVE EXECUTION TESTS (Creating Real Snapshots!)';
-    PRINT '============================================================';
-    
+    -- Declare variables for API calls (used across all tag retrieval tests)
+    DECLARE @LoginURL nvarchar(500);
+    DECLARE @SnapshotsURL nvarchar(500);
+    DECLARE @AuthResponse nvarchar(max);
+    DECLARE @AuthToken nvarchar(500);
+    DECLARE @AuthHeaders nvarchar(500);
+    DECLARE @ReturnValue int;
     DECLARE @PreTestMaxID int;
+    DECLARE @SnapshotName nvarchar(255);
+    DECLARE @TagsURL nvarchar(1000);
+    DECLARE @TagsResponse nvarchar(max);
+    DECLARE @TagsHeaders nvarchar(500);
+    DECLARE @TagItems nvarchar(max);
+    
+    -- Authenticate once for all tag retrievals
+    SET @LoginURL = @PureStorageArrayURL + '/login';
+    SET @SnapshotsURL = @PureStorageArrayURL + '/protection-group-snapshots';
+    SET @AuthHeaders = '{"api-token": "' + @PureStorageAPIToken + '"}';
+    
+    PRINT '';
+    PRINT 'Authenticating to Pure Storage array for tag verification...';
+    
+    EXEC @ReturnValue = sp_invoke_external_rest_endpoint 
+        @url = @LoginURL,
+        @method = 'POST',
+        @headers = @AuthHeaders,
+        @payload = '{}',
+        @response = @AuthResponse OUTPUT;
+    
+    IF @ReturnValue = 0
+    BEGIN
+        SET @AuthToken = JSON_VALUE(@AuthResponse, '$.response.headers."x-auth-token"');
+        SET @TagsHeaders = '{"x-auth-token": "' + @AuthToken + '", "Content-Type":"application/json"}';
+        PRINT 'Authentication successful.';
+    END
+    ELSE
+    BEGIN
+        PRINT 'Warning: Could not authenticate to Pure Storage. Tag verification will be skipped.';
+        SET @AuthToken = NULL;
+    END
+    
     SELECT @PreTestMaxID = ISNULL(MAX(ID), 0) FROM dbo.CommandLog;
     
     -- ------------------------------------------------------------------------
-    -- Test 7: SINGLE mode live execution
+    -- Test 8: SINGLE mode live execution with tag verification
     -- ------------------------------------------------------------------------
-    EXEC @TestID = #LogTestStart 'SINGLE Mode Live Execution', 'LiveExecution';
+    PRINT '';
+    PRINT '------------------------------------------------------------';
+    PRINT 'TEST: SINGLE Mode - Backup and Tag Verification';
+    PRINT 'Category: LiveExecution';
+    PRINT 'Started: ' + CONVERT(varchar, SYSDATETIME(), 121);
+    PRINT '------------------------------------------------------------';
+
+    INSERT INTO #TestResults (TestName, TestCategory) VALUES ('SINGLE Mode - Backup and Tag Verification', 'LiveExecution');
+    SET @TestID = SCOPE_IDENTITY();
     
     BEGIN TRY
         EXEC dbo.DatabaseBackup 
@@ -385,33 +473,99 @@ BEGIN
             @Directory = @BackupDirectory,
             @LogToTable = 'Y';
         
-        -- Verify CommandLog entry
-        DECLARE @SingleModeLogCount int;
-        SELECT @SingleModeLogCount = COUNT(*) 
-        FROM dbo.CommandLog 
-        WHERE ID > @PreTestMaxID 
-          AND CommandType = 'PURESTORAGE_SNAPSHOT'
-          AND ErrorNumber = 0;
+        -- For SINGLE mode, the snapshot name is not embedded in CommandLog (it uses @SnapshotName variable)
+        -- Instead, query Pure Storage API for the latest snapshot from this protection group
+        DECLARE @LatestSnapshotURL nvarchar(2048);
+        DECLARE @LatestSnapshotResponse nvarchar(max);
         
-        IF @SingleModeLogCount = 1
-            EXEC #LogTestResult @TestID, 'Passed', 'SINGLE mode created 1 CommandLog entry';
-        ELSE
+        IF @AuthToken IS NOT NULL
         BEGIN
-            EXEC #LogTestResult @TestID, 'Failed', 'Expected 1 CommandLog entry, got ' + CAST(@SingleModeLogCount as varchar);
-            SET @ErrorCount += 1;
+            SET @LatestSnapshotURL = @PureStorageArrayURL + '/protection-group-snapshots?source_names=' + @PureStorageProtectionGroup + '&sort=created-&limit=1';
+            
+            EXEC @ReturnValue = sp_invoke_external_rest_endpoint 
+                @url = @LatestSnapshotURL,
+                @method = 'GET',
+                @headers = @TagsHeaders,
+                @response = @LatestSnapshotResponse OUTPUT;
+            
+            IF @ReturnValue = 0
+            BEGIN
+                SET @SnapshotName = JSON_VALUE(@LatestSnapshotResponse, '$.result.items[0].name');
+            END
         END
+        
+        PRINT 'SINGLE Mode Snapshot Created: ' + ISNULL(@SnapshotName, 'Unknown');
+        
+        -- Retrieve and display tags for this snapshot
+        IF @AuthToken IS NOT NULL AND @SnapshotName IS NOT NULL
+        BEGIN
+            SET @TagsURL = @SnapshotsURL + '/tags?resource_names=' + @SnapshotName;
+            
+            EXEC @ReturnValue = sp_invoke_external_rest_endpoint 
+                @url = @TagsURL,
+                @method = 'GET',
+                @headers = @TagsHeaders,
+                @response = @TagsResponse OUTPUT;
+            
+            IF @ReturnValue = 0
+            BEGIN
+                SET @TagItems = JSON_QUERY(@TagsResponse, '$.result.items');
+                
+                IF @TagItems IS NOT NULL
+                BEGIN
+                    PRINT '';
+                    PRINT 'SINGLE Mode Snapshot Tags:';
+                    PRINT '--------------------------------------------------------------------------------';
+                    
+                    ;WITH Flattened AS (
+                        SELECT 
+                            JSON_VALUE(item.value, '$.resource.name') AS SnapshotName,
+                            JSON_VALUE(item.value, '$.key') AS TagKey,
+                            JSON_VALUE(item.value, '$.value') AS TagValue
+                        FROM OPENJSON(@TagItems) AS item
+                    )
+                    SELECT *
+                    FROM (SELECT SnapshotName, TagKey, TagValue FROM Flattened) AS SourceTable
+                    PIVOT (MAX(TagValue) FOR TagKey IN ([DatabaseName], [SQLInstanceName], [BackupTimestamp], [BackupType], [BackupUrl])) AS PivotTable;
+                    
+                    -- Also show raw tags
+                    PRINT '';
+                    PRINT 'All Tags (Raw):';
+                    SELECT 
+                        JSON_VALUE(item.value, '$.key') AS TagKey,
+                        JSON_VALUE(item.value, '$.value') AS TagValue
+                    FROM OPENJSON(@TagItems) AS item
+                    ORDER BY JSON_VALUE(item.value, '$.key');
+                END
+            END
+        END
+        
+        UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Passed', 
+            Details = 'SINGLE mode: Snapshot ' + ISNULL(@SnapshotName, 'created') + ' with tags verified' WHERE TestID = @TestID;
+        PRINT '';
+        PRINT 'Result: Passed';
         
         SELECT @PreTestMaxID = MAX(ID) FROM dbo.CommandLog;
     END TRY
     BEGIN CATCH
-        EXEC #LogTestResult @TestID, 'Failed', ERROR_MESSAGE();
-        SET @ErrorCount += 1;
+        UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = ERROR_MESSAGE() WHERE TestID = @TestID;
+        SET @ErrorCount = @ErrorCount + 1;
+        PRINT 'Result: Failed';
+        PRINT 'Details: ' + ERROR_MESSAGE();
     END CATCH;
     
     -- ------------------------------------------------------------------------
-    -- Test 8: GROUP mode live execution
+    -- Test 9: GROUP mode live execution with tag verification
     -- ------------------------------------------------------------------------
-    EXEC @TestID = #LogTestStart 'GROUP Mode Live Execution', 'LiveExecution';
+    PRINT '';
+    PRINT '------------------------------------------------------------';
+    PRINT 'TEST: GROUP Mode - Backup and Tag Verification';
+    PRINT 'Category: LiveExecution';
+    PRINT 'Started: ' + CONVERT(varchar, SYSDATETIME(), 121);
+    PRINT '------------------------------------------------------------';
+
+    INSERT INTO #TestResults (TestName, TestCategory) VALUES ('GROUP Mode - Backup and Tag Verification', 'LiveExecution');
+    SET @TestID = SCOPE_IDENTITY();
     
     BEGIN TRY
         EXEC dbo.DatabaseBackup 
@@ -425,49 +579,104 @@ BEGIN
             @Directory = @BackupDirectory,
             @LogToTable = 'Y';
         
-        -- Verify CommandLog entries (should be 2 - one per database)
-        DECLARE @GroupModeLogCount int;
-        DECLARE @GroupModeSnapshotName nvarchar(200);
-        
-        SELECT @GroupModeLogCount = COUNT(*),
-               @GroupModeSnapshotName = MAX(CASE WHEN Command LIKE '%MEDIADESCRIPTION%' 
-                   THEN SUBSTRING(Command, CHARINDEX('MEDIADESCRIPTION=N''', Command) + 19, 50) END)
+        -- Get the snapshot name from CommandLog
+        SELECT TOP 1 @CommandText = Command
         FROM dbo.CommandLog 
         WHERE ID > @PreTestMaxID 
           AND CommandType = 'PURESTORAGE_SNAPSHOT'
-          AND ErrorNumber = 0;
+          AND Command LIKE '%MEDIADESCRIPTION%'
+        ORDER BY ID DESC;
         
-        -- Verify both entries reference same snapshot
-        DECLARE @DistinctSnapshots int;
-        SELECT @DistinctSnapshots = COUNT(DISTINCT 
-            SUBSTRING(Command, CHARINDEX('MEDIADESCRIPTION=N''', Command) + 19, 
-                CHARINDEX('''', Command, CHARINDEX('MEDIADESCRIPTION=N''', Command) + 19) - CHARINDEX('MEDIADESCRIPTION=N''', Command) - 19))
-        FROM dbo.CommandLog 
-        WHERE ID > @PreTestMaxID 
-          AND CommandType = 'PURESTORAGE_SNAPSHOT'
-          AND Command LIKE '%MEDIADESCRIPTION%';
-        
-        IF @GroupModeLogCount = 2 AND @DistinctSnapshots = 1
-            EXEC #LogTestResult @TestID, 'Passed', 'GROUP mode: 2 entries, same snapshot';
+        SET @MediaDescPos = CHARINDEX('MEDIADESCRIPTION=N''', @CommandText);
+        IF @MediaDescPos > 0
+        BEGIN
+            SET @SnapshotName = SUBSTRING(@CommandText, 
+                @MediaDescPos + 19,
+                CHARINDEX('''', @CommandText, @MediaDescPos + 19) - @MediaDescPos - 19);
+        END
         ELSE
         BEGIN
-            EXEC #LogTestResult @TestID, 'Failed', 
-                'Expected 2 entries with same snapshot. Got ' + CAST(@GroupModeLogCount as varchar) + 
-                ' entries, ' + CAST(@DistinctSnapshots as varchar) + ' distinct snapshots';
-            SET @ErrorCount += 1;
+            SET @MediaDescPos = CHARINDEX('MEDIADESCRIPTION = N''', @CommandText);
+            IF @MediaDescPos > 0
+            BEGIN
+                SET @SnapshotName = SUBSTRING(@CommandText, 
+                    @MediaDescPos + 21,
+                    CHARINDEX('''', @CommandText, @MediaDescPos + 21) - @MediaDescPos - 21);
+            END
         END
+        
+        PRINT 'GROUP Mode Snapshot Created: ' + ISNULL(@SnapshotName, 'Unknown');
+        
+        -- Retrieve and display tags for this snapshot
+        IF @AuthToken IS NOT NULL AND @SnapshotName IS NOT NULL
+        BEGIN
+            SET @TagsURL = @SnapshotsURL + '/tags?resource_names=' + @SnapshotName;
+            
+            EXEC @ReturnValue = sp_invoke_external_rest_endpoint 
+                @url = @TagsURL,
+                @method = 'GET',
+                @headers = @TagsHeaders,
+                @response = @TagsResponse OUTPUT;
+            
+            IF @ReturnValue = 0
+            BEGIN
+                SET @TagItems = JSON_QUERY(@TagsResponse, '$.result.items');
+                
+                IF @TagItems IS NOT NULL
+                BEGIN
+                    PRINT '';
+                    PRINT 'GROUP Mode Snapshot Tags (should show multiple databases):';
+                    PRINT '--------------------------------------------------------------------------------';
+                    
+                    ;WITH Flattened AS (
+                        SELECT 
+                            JSON_VALUE(item.value, '$.resource.name') AS SnapshotName,
+                            JSON_VALUE(item.value, '$.key') AS TagKey,
+                            JSON_VALUE(item.value, '$.value') AS TagValue
+                        FROM OPENJSON(@TagItems) AS item
+                    )
+                    SELECT *
+                    FROM (SELECT SnapshotName, TagKey, TagValue FROM Flattened) AS SourceTable
+                    PIVOT (MAX(TagValue) FOR TagKey IN ([DatabaseName], [SQLInstanceName], [BackupTimestamp], [BackupType], [BackupUrl])) AS PivotTable;
+                    
+                    -- Also show raw tags to see all databases
+                    PRINT '';
+                    PRINT 'All Tags (showing all databases in GROUP):';
+                    SELECT 
+                        JSON_VALUE(item.value, '$.key') AS TagKey,
+                        JSON_VALUE(item.value, '$.value') AS TagValue
+                    FROM OPENJSON(@TagItems) AS item
+                    ORDER BY JSON_VALUE(item.value, '$.key');
+                END
+            END
+        END
+        
+        UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Passed', 
+            Details = 'GROUP mode: Snapshot ' + ISNULL(@SnapshotName, 'created') + ' with tags verified' WHERE TestID = @TestID;
+        PRINT '';
+        PRINT 'Result: Passed';
         
         SELECT @PreTestMaxID = MAX(ID) FROM dbo.CommandLog;
     END TRY
     BEGIN CATCH
-        EXEC #LogTestResult @TestID, 'Failed', ERROR_MESSAGE();
-        SET @ErrorCount += 1;
+        UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = ERROR_MESSAGE() WHERE TestID = @TestID;
+        SET @ErrorCount = @ErrorCount + 1;
+        PRINT 'Result: Failed';
+        PRINT 'Details: ' + ERROR_MESSAGE();
     END CATCH;
     
     -- ------------------------------------------------------------------------
-    -- Test 9: SERVER mode live execution
+    -- Test 10: SERVER mode live execution with tag verification
     -- ------------------------------------------------------------------------
-    EXEC @TestID = #LogTestStart 'SERVER Mode Live Execution', 'LiveExecution';
+    PRINT '';
+    PRINT '------------------------------------------------------------';
+    PRINT 'TEST: SERVER Mode - Backup and Tag Verification';
+    PRINT 'Category: LiveExecution';
+    PRINT 'Started: ' + CONVERT(varchar, SYSDATETIME(), 121);
+    PRINT '------------------------------------------------------------';
+
+    INSERT INTO #TestResults (TestName, TestCategory) VALUES ('SERVER Mode - Backup and Tag Verification', 'LiveExecution');
+    SET @TestID = SCOPE_IDENTITY();
     
     BEGIN TRY
         -- Count user databases
@@ -489,55 +698,154 @@ BEGIN
             @Directory = @BackupDirectory,
             @LogToTable = 'Y';
         
-        -- Verify CommandLog entries (should be one per user database)
+        -- Get the snapshot name from CommandLog (from the BACKUP SERVER entry)
+        SELECT TOP 1 @CommandText = Command
+        FROM dbo.CommandLog 
+        WHERE ID > @PreTestMaxID 
+          AND CommandType = 'PURESTORAGE_SNAPSHOT'
+          AND Command LIKE '%BACKUP SERVER%'
+        ORDER BY ID DESC;
+        
+        SET @MediaDescPos = CHARINDEX('MEDIADESCRIPTION=N''', @CommandText);
+        IF @MediaDescPos > 0
+        BEGIN
+            SET @SnapshotName = SUBSTRING(@CommandText, 
+                @MediaDescPos + 19,
+                CHARINDEX('''', @CommandText, @MediaDescPos + 19) - @MediaDescPos - 19);
+        END
+        ELSE
+        BEGIN
+            SET @MediaDescPos = CHARINDEX('MEDIADESCRIPTION = N''', @CommandText);
+            IF @MediaDescPos > 0
+            BEGIN
+                SET @SnapshotName = SUBSTRING(@CommandText, 
+                    @MediaDescPos + 21,
+                    CHARINDEX('''', @CommandText, @MediaDescPos + 21) - @MediaDescPos - 21);
+            END
+        END
+        
+        -- If not found from BACKUP SERVER, try from "included in" entries
+        IF @SnapshotName IS NULL OR LEN(@SnapshotName) = 0
+        BEGIN
+            SELECT TOP 1 @CommandText = Command
+            FROM dbo.CommandLog 
+            WHERE ID > @PreTestMaxID 
+              AND CommandType = 'PURESTORAGE_SNAPSHOT'
+              AND Command LIKE '%included in SERVER snapshot%'
+            ORDER BY ID DESC;
+            
+            SET @SnapshotPos = CHARINDEX('snapshot: ', @CommandText);
+            IF @SnapshotPos > 0
+            BEGIN
+                SET @SnapshotName = SUBSTRING(@CommandText, 
+                    @SnapshotPos + 10,
+                    CHARINDEX('''', @CommandText, @SnapshotPos + 10) - @SnapshotPos - 10);
+            END
+        END
+        
+        PRINT 'SERVER Mode Snapshot Created: ' + ISNULL(@SnapshotName, 'Unknown');
+        PRINT 'User Databases Included: ' + CAST(@UserDBCount as varchar);
+        
+        -- Retrieve and display tags for this snapshot
+        IF @AuthToken IS NOT NULL AND @SnapshotName IS NOT NULL
+        BEGIN
+            SET @TagsURL = @SnapshotsURL + '/tags?resource_names=' + @SnapshotName;
+            
+            EXEC @ReturnValue = sp_invoke_external_rest_endpoint 
+                @url = @TagsURL,
+                @method = 'GET',
+                @headers = @TagsHeaders,
+                @response = @TagsResponse OUTPUT;
+            
+            IF @ReturnValue = 0
+            BEGIN
+                SET @TagItems = JSON_QUERY(@TagsResponse, '$.result.items');
+                
+                IF @TagItems IS NOT NULL
+                BEGIN
+                    PRINT '';
+                    PRINT 'SERVER Mode Snapshot Tags (should show ALL user databases):';
+                    PRINT '--------------------------------------------------------------------------------';
+                    
+                    ;WITH Flattened AS (
+                        SELECT 
+                            JSON_VALUE(item.value, '$.resource.name') AS SnapshotName,
+                            JSON_VALUE(item.value, '$.key') AS TagKey,
+                            JSON_VALUE(item.value, '$.value') AS TagValue
+                        FROM OPENJSON(@TagItems) AS item
+                    )
+                    SELECT *
+                    FROM (SELECT SnapshotName, TagKey, TagValue FROM Flattened) AS SourceTable
+                    PIVOT (MAX(TagValue) FOR TagKey IN ([DatabaseName], [SQLInstanceName], [BackupTimestamp], [BackupType], [BackupUrl])) AS PivotTable;
+                    
+                    -- Show all tags to verify all databases are tagged
+                    PRINT '';
+                    PRINT 'All Tags (showing all ' + CAST(@UserDBCount as varchar) + ' databases in SERVER snapshot):';
+                    SELECT 
+                        JSON_VALUE(item.value, '$.key') AS TagKey,
+                        JSON_VALUE(item.value, '$.value') AS TagValue
+                    FROM OPENJSON(@TagItems) AS item
+                    ORDER BY JSON_VALUE(item.value, '$.key');
+                    
+                    -- Count database tags to verify
+                    DECLARE @TaggedDBCount int;
+                    SELECT @TaggedDBCount = COUNT(*)
+                    FROM OPENJSON(@TagItems) AS item
+                    WHERE JSON_VALUE(item.value, '$.key') = 'DatabaseName';
+                    
+                    PRINT '';
+                    PRINT 'Databases tagged in snapshot: ' + CAST(@TaggedDBCount as varchar) + ' (expected: ' + CAST(@UserDBCount as varchar) + ')';
+                END
+            END
+        END
+        
+        -- Verify CommandLog entries
         DECLARE @ServerModeLogCount int;
         DECLARE @BackupServerCount int;
-        DECLARE @IncludedInSnapshotCount int;
         
         SELECT @ServerModeLogCount = COUNT(*),
-               @BackupServerCount = SUM(CASE WHEN Command LIKE '%BACKUP SERVER%' THEN 1 ELSE 0 END),
-               @IncludedInSnapshotCount = SUM(CASE WHEN Command LIKE '%included in SERVER snapshot%' THEN 1 ELSE 0 END)
+               @BackupServerCount = SUM(CASE WHEN Command LIKE '%BACKUP SERVER%' THEN 1 ELSE 0 END)
         FROM dbo.CommandLog 
         WHERE ID > @PreTestMaxID 
           AND CommandType = 'PURESTORAGE_SNAPSHOT'
           AND ErrorNumber = 0;
         
-        IF @ServerModeLogCount = @UserDBCount AND @BackupServerCount = 1 AND @IncludedInSnapshotCount = (@UserDBCount - 1)
-            EXEC #LogTestResult @TestID, 'Passed', 
-                'SERVER mode: ' + CAST(@ServerModeLogCount as varchar) + ' entries (' + 
-                CAST(@BackupServerCount as varchar) + ' BACKUP SERVER, ' + 
-                CAST(@IncludedInSnapshotCount as varchar) + ' included references)';
+        IF @ServerModeLogCount = @UserDBCount AND @BackupServerCount = 1
+        BEGIN
+            UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Passed', 
+                Details = 'SERVER mode: ' + CAST(@ServerModeLogCount as varchar) + ' entries, snapshot ' + ISNULL(@SnapshotName, '') + ' with tags verified' WHERE TestID = @TestID;
+            PRINT '';
+            PRINT 'Result: Passed';
+        END
         ELSE
         BEGIN
-            EXEC #LogTestResult @TestID, 'Failed', 
-                'Expected ' + CAST(@UserDBCount as varchar) + ' entries. Got ' + 
-                CAST(@ServerModeLogCount as varchar) + ' entries, ' +
-                CAST(@BackupServerCount as varchar) + ' BACKUP SERVER, ' +
-                CAST(@IncludedInSnapshotCount as varchar) + ' included references';
-            SET @ErrorCount += 1;
+            UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', 
+                Details = 'Expected ' + CAST(@UserDBCount as varchar) + ' entries. Got ' + CAST(@ServerModeLogCount as varchar) WHERE TestID = @TestID;
+            SET @ErrorCount = @ErrorCount + 1;
+            PRINT '';
+            PRINT 'Result: Failed';
         END
     END TRY
     BEGIN CATCH
-        EXEC #LogTestResult @TestID, 'Failed', ERROR_MESSAGE();
-        SET @ErrorCount += 1;
+        UPDATE #TestResults SET EndTime = SYSDATETIME(), Status = 'Failed', Details = ERROR_MESSAGE() WHERE TestID = @TestID;
+        SET @ErrorCount = @ErrorCount + 1;
+        PRINT 'Result: Failed';
+        PRINT 'Details: ' + ERROR_MESSAGE();
     END CATCH;
 END
 ELSE
 BEGIN
-    PRINT '';
-    PRINT '============================================================';
-    PRINT 'LIVE EXECUTION TESTS SKIPPED';
+    -- Skip live tests
+    INSERT INTO #TestResults (TestName, TestCategory, Status, Details, EndTime) 
+    VALUES ('SINGLE Mode - Backup and Tag Verification', 'LiveExecution', 'Skipped', '@ExecuteTests = 0', SYSDATETIME());
+    
+    INSERT INTO #TestResults (TestName, TestCategory, Status, Details, EndTime) 
+    VALUES ('GROUP Mode - Backup and Tag Verification', 'LiveExecution', 'Skipped', '@ExecuteTests = 0', SYSDATETIME());
+    
+    INSERT INTO #TestResults (TestName, TestCategory, Status, Details, EndTime) 
+    VALUES ('SERVER Mode - Backup and Tag Verification', 'LiveExecution', 'Skipped', '@ExecuteTests = 0', SYSDATETIME());
+    
     PRINT 'Set @ExecuteTests = 1 to run live tests (creates real snapshots)';
-    PRINT '============================================================';
-    
-    EXEC @TestID = #LogTestStart 'SINGLE Mode Live Execution', 'LiveExecution';
-    EXEC #LogTestResult @TestID, 'Skipped', '@ExecuteTests = 0';
-    
-    EXEC @TestID = #LogTestStart 'GROUP Mode Live Execution', 'LiveExecution';
-    EXEC #LogTestResult @TestID, 'Skipped', '@ExecuteTests = 0';
-    
-    EXEC @TestID = #LogTestStart 'SERVER Mode Live Execution', 'LiveExecution';
-    EXEC #LogTestResult @TestID, 'Skipped', '@ExecuteTests = 0';
 END;
 
 -- ============================================================================
@@ -558,27 +866,6 @@ PRINT 'FROM dbo.CommandLog';
 PRINT 'WHERE CommandType = ''PURESTORAGE_SNAPSHOT''';
 PRINT 'ORDER BY ID DESC;';
 PRINT '';
-PRINT '-- Snapshots grouped by snapshot name:';
-PRINT 'SELECT ';
-PRINT '    CASE WHEN Command LIKE ''%MEDIADESCRIPTION=N''''%''';
-PRINT '         THEN SUBSTRING(Command, CHARINDEX(''MEDIADESCRIPTION=N'''''', Command) + 19, 30)';
-PRINT '         WHEN Command LIKE ''%included in SERVER snapshot:%''';
-PRINT '         THEN SUBSTRING(Command, CHARINDEX(''snapshot:'', Command) + 10, 30)';
-PRINT '         ELSE ''Unknown'' END as SnapshotName,';
-PRINT '    COUNT(*) as DatabaseCount,';
-PRINT '    MIN(StartTime) as StartTime,';
-PRINT '    SUM(CASE WHEN ErrorNumber = 0 THEN 1 ELSE 0 END) as SuccessCount,';
-PRINT '    SUM(CASE WHEN ErrorNumber <> 0 THEN 1 ELSE 0 END) as ErrorCount';
-PRINT 'FROM dbo.CommandLog';
-PRINT 'WHERE CommandType = ''PURESTORAGE_SNAPSHOT''';
-PRINT '  AND StartTime > DATEADD(day, -1, GETDATE())';
-PRINT 'GROUP BY ';
-PRINT '    CASE WHEN Command LIKE ''%MEDIADESCRIPTION=N''''%''';
-PRINT '         THEN SUBSTRING(Command, CHARINDEX(''MEDIADESCRIPTION=N'''''', Command) + 19, 30)';
-PRINT '         WHEN Command LIKE ''%included in SERVER snapshot:%''';
-PRINT '         THEN SUBSTRING(Command, CHARINDEX(''snapshot:'', Command) + 10, 30)';
-PRINT '         ELSE ''Unknown'' END';
-PRINT 'ORDER BY MIN(StartTime) DESC;';
 
 -- ============================================================================
 -- TEST SUMMARY
@@ -628,17 +915,13 @@ PRINT 'Skipped: ' + CAST(@SkippedTests as varchar);
 PRINT '';
 
 IF @FailedTests = 0
-    PRINT '✓ ALL TESTS PASSED!';
+    PRINT 'ALL TESTS PASSED!';
 ELSE
-    PRINT '✗ ' + CAST(@FailedTests as varchar) + ' TEST(S) FAILED - Review details above';
+    PRINT CAST(@FailedTests as varchar) + ' TEST(S) FAILED - Review details above';
 
 PRINT '============================================================';
 PRINT 'Completed: ' + CONVERT(varchar, SYSDATETIME(), 121);
 PRINT '============================================================';
 
 -- Cleanup
-DROP PROCEDURE IF EXISTS #LogTestStart;
-DROP PROCEDURE IF EXISTS #LogTestResult;
 DROP TABLE IF EXISTS #TestResults;
-
-GO

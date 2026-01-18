@@ -9,10 +9,12 @@ EXEC dbo.DatabaseBackup
     @Directory = 'C:\Backups\',
     @LogToTable = 'Y'
 
-SELECT TOP 1
+
+SELECT TOP 10
     ID, DatabaseName, CommandType, Command, 
     StartTime, EndTime, ErrorNumber, ErrorMessage
-FROM dbo.CommandLog
+FROM dbo.CommandLog 
+WHERE DatabaseName = 'TPCC-4T'
 ORDER BY StartTime DESC;
 
 
@@ -32,6 +34,7 @@ SELECT TOP 10
     ID, DatabaseName, CommandType, Command, 
     StartTime, EndTime, ErrorNumber, ErrorMessage
 FROM dbo.CommandLog
+WHERE DatabaseName IN ('TPCC-4T', 'TPCC500G')
 ORDER BY StartTime DESC;
 
 
@@ -48,7 +51,7 @@ EXEC dbo.DatabaseBackup
   @LogToTable = 'Y'
 
 -- To see all snapshot-related commands (suspend, backup, unsuspend, Pure Storage API calls)
-SELECT TOP 10 
+SELECT TOP 20
     ID, DatabaseName, CommandType, Command, 
     StartTime, EndTime, ErrorNumber, ErrorMessage
 FROM dbo.CommandLog
