@@ -11,12 +11,21 @@ The integration enables hardware-based snapshot backups through Pure Storage Fla
 - **Three snapshot modes** for flexible backup strategies
 - **Automatic tagging** for snapshot identification and recovery
 
+## Support Disclaimer
+
+This repository is community-driven and provided as-is. It is not an official Pure Storage supported product. Do not contact Pure Storage Support for issues with this code; use at your own risk and validate thoroughly in non-production environments before adoption.
+
 ## Requirements
 
 - **SQL Server 2025** or later (required for `sp_invoke_external_rest_endpoint` and `BACKUP SERVER`)
 - **Pure Storage FlashArray** with REST API v2.x
 - **Protection Group** configured with volumes containing SQL Server data files
 - **API Token** with permissions to create snapshots and manage tags
+
+### Security Notes
+
+- Do not store real API tokens in source files. Use secure secrets handling (e.g., SQL credentials, secure configuration tables, or environment-specific secrets management) and rotate tokens regularly.
+- Restrict API token scope to the minimum required (snapshot creation, tag management) and prefer read-only for query examples where possible.
 
 ## Installation
 
@@ -211,9 +220,10 @@ EXEC sp_invoke_external_rest_endpoint
 
 | File | Description |
 |------|-------------|
-| `MaintenanceSolution.sql` | Complete solution with Pure Storage integration |
-| `olasnapshot.sql` | Configuration and setup for snapshot backups |
-| `DatabaseBackup_ORIG.sql` | Original Ola Hallengren DatabaseBackup procedure |
+| `MaintenanceSolution.sql` | Complete solution with Pure Storage snapshot integration |
+| `olasnapshot.sql` | Usage examples: SINGLE/GROUP/SERVER modes and REST queries |
+| `test_snapshot_backup.sql` | Test harness to exercise snapshot backups and review logs |
+| `README.md` | Project documentation and usage notes |
 
 ## Changes from Original
 
@@ -226,6 +236,13 @@ This fork adds the following to the original Ola Hallengren solution:
 5. **Pure Storage REST API integration** for authentication, snapshot creation, and tagging
 6. **SERVER mode support** using SQL Server 2025's `BACKUP SERVER` command
 7. **QUOTENAME() fix** for hyphenated database names (e.g., `TPCC-4T`)
+
+## Recent Changes
+
+- Added `test_snapshot_backup.sql` to quickly validate snapshot backup flows and review `dbo.CommandLog` output.
+- Expanded `olasnapshot.sql` examples for GROUP and SERVER modes, including REST queries for recent snapshots and tag inspection.
+- Updated Files section to reflect current workspace contents.
+- Added Support Disclaimer clarifying community-as-is status and lack of Pure Storage official support.
 
 ## License
 
